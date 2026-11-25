@@ -87,6 +87,40 @@ export function createInitialAircraftState(): AircraftPhysicsState {
   return state;
 }
 
+export function createSmoothedControlState(): ControlInputs {
+  return {
+    pitch: 0,
+    roll: 0,
+    yaw: 0,
+    throttleDelta: 0,
+    afterburnerBoost: false,
+    airbrake: false,
+  };
+}
+
+/**
+ * Fly-by-wire control-input smoothing & speed-dependent stick shaping.
+ * Smooths abrupt digital keyboard taps cleanly without introducing sluggishness.
+ */
+export function smoothControlInputs(
+  smoothed: ControlInputs,
+  raw: ControlInputs,
+  mach: number,
+  dt: number
+): void {
+  const highSpeedDamp = 1 - THREE.MathUtils.clamp((mach - 0.85) * 0.28, 0, 0.35);
+  const pitchRate = 11.5 * highSpeedDamp;
+  const rollRate = 13.5 * highSpeedDamp;
+  const yawRate = 10.0;
+
+  smoothed.pitch = THREE.MathUtils.damp(smoothed.pitch, raw.pitch, pitchRate, dt);
+  smoothed.roll = THREE.MathUtils.damp(smoothed.roll, raw.roll, rollRate, dt);
+  smoothed.yaw = THREE.MathUtils.damp(smoothed.yaw, raw.yaw, yawRate, dt);
+  smoothed.throttleDelta = raw.throttleDelta;
+  smoothed.afterburnerBoost = raw.afterburnerBoost;
+  smoothed.airbrake = raw.airbrake;
+}
+
 export function stepAircraftPhysics(
   s: AircraftPhysicsState,
   input: ControlInputs,

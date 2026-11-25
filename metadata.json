@@ -2,5 +2,7 @@
   "name": "Vanguard — 3D Supersonic Jet Fighter Simulator",
   "description": "Realistic 3D supersonic jet fighter combat simulator with 6-DOF aerodynamic flight physics, M61 Vulcan rotary cannon, proportional-navigation missiles, flares, and tactical cockpit HUD.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

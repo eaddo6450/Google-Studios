@@ -67,7 +67,9 @@ export interface VolumetricCloudSystem {
     windVecX: number,
     windVecZ: number,
     stormFactor: number,
-    rainIntensity: number
+    rainIntensity: number,
+    sunDir?: THREE.Vector3,
+    skyFogColor?: THREE.Color
   ) => number;
   dispose: () => void;
 }
@@ -338,16 +340,25 @@ export function createVolumetricCloudSystem(isSoftwareGl: boolean): VolumetricCl
       windVecX: number,
       windVecZ: number,
       stormFactor: number,
-      rainIntensity: number
+      rainIntensity: number,
+      sunDir?: THREE.Vector3,
+      skyFogColor?: THREE.Color
     ): number => {
       const altDensity = cloudDensityAtAltitude(aircraftPos.y);
       volumetricMat.uniforms.uAltDensity.value = altDensity;
       volumetricMat.uniforms.uStorminess.value = stormFactor;
-      volumetricMat.uniforms.uFogColor.value.setRGB(
-        THREE.MathUtils.lerp(0.77, 0.48, stormFactor),
-        THREE.MathUtils.lerp(0.86, 0.56, stormFactor),
-        THREE.MathUtils.lerp(0.93, 0.65, stormFactor)
-      );
+      if (sunDir) {
+        (volumetricMat.uniforms.uSunDir.value as THREE.Vector3).copy(sunDir);
+      }
+      if (skyFogColor) {
+        (volumetricMat.uniforms.uFogColor.value as THREE.Color).copy(skyFogColor);
+      } else {
+        volumetricMat.uniforms.uFogColor.value.setRGB(
+          THREE.MathUtils.lerp(0.77, 0.48, stormFactor),
+          THREE.MathUtils.lerp(0.86, 0.56, stormFactor),
+          THREE.MathUtils.lerp(0.93, 0.65, stormFactor)
+        );
+      }
 
       // Integrate continuous wind drift smoothly so wind shifts never snap cloud positions
       driftAccumX += windVecX * dt * 1.1;
@@ -382,11 +393,15 @@ export function createVolumetricCloudSystem(isSoftwareGl: boolean): VolumetricCl
 
       // Wrap local speed wisps around aircraft XZ neighborhood & advect along wind vector
       wispMat.opacity = 0.06 + altDensity * 0.24 + insideCloudProximity * 0.14 + stormFactor * 0.08;
-      wispMat.color.setRGB(
-        THREE.MathUtils.lerp(0.96, 0.72, stormFactor),
-        THREE.MathUtils.lerp(0.97, 0.78, stormFactor),
-        THREE.MathUtils.lerp(0.99, 0.85, stormFactor)
-      );
+      if (skyFogColor) {
+        wispMat.color.copy(skyFogColor).lerp(_cColor.setRGB(0.96, 0.98, 1.0), 0.52 - stormFactor * 0.25);
+      } else {
+        wispMat.color.setRGB(
+          THREE.MathUtils.lerp(0.96, 0.72, stormFactor),
+          THREE.MathUtils.lerp(0.97, 0.78, stormFactor),
+          THREE.MathUtils.lerp(0.99, 0.85, stormFactor)
+        );
+      }
 
       for (let i = 0; i < wisps.length; i++) {
         const w = wisps[i];

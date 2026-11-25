@@ -1,13 +1,13 @@
 import * as THREE from 'three';
 import { createVolumetricCloudSystem, type VolumetricCloudSystem } from './clouds';
 import type { SimMaterialLibrary } from './materials';
+import type { TimeOfDay } from './types';
 
 export const WORLD_RADIUS = 16000;
 export const RUNWAY_CENTER = new THREE.Vector3(0, 18.2, -400);
 export const RUNWAY_LENGTH = 2400;
 export const RUNWAY_WIDTH = 72;
 
-// Deterministic 2D hash & smooth value noise
 function hash2(ix: number, iz: number): number {
   const n = Math.sin(ix * 127.1 + iz * 311.7) * 43758.5453123;
   return n - Math.floor(n);
@@ -41,28 +41,19 @@ function fbm(x: number, z: number): number {
   return v;
 }
 
-/**
- * Deterministic terrain elevation in meters.
- * Ocean surface sits at y = 0.
- * Coastal airbase plateau sits around (0, -400) at y = 18m.
- */
 export function groundHeightAt(x: number, z: number): number {
-  // Coastal channel runs diagonally/horizontally around x in [-1600, 1600] except the airbase peninsula
   const n1 = fbm(x * 0.00022 + 12.4, z * 0.00022 - 7.1);
   const ridge = Math.abs(fbm(x * 0.00055 - 3.2, z * 0.00055 + 9.8) - 0.5) * 2.0;
 
-  // Mountain elevation sculpted around coastal fjords
   const channelCut = Math.exp(-Math.pow((x - Math.sin(z * 0.00035) * 1400) / 2100, 2));
   let h = (n1 * 880 + (1 - ridge) * 420 - 260) * (1 - channelCut * 0.88);
 
-  // Outer dramatic mountain wall ring for natural perimeter
   const distFromCenter = Math.hypot(x, z);
   if (distFromCenter > 9500) {
     const rim = Math.min(1, (distFromCenter - 9500) / 5500);
     h += rim * 700 * (0.6 + n1 * 0.6);
   }
 
-  // Smooth plateau for the Airbase Runway peninsula around (0, -400)
   const dxBase = Math.abs(x - RUNWAY_CENTER.x);
   const dzBase = Math.abs(z - RUNWAY_CENTER.z);
   const baseMaskX = Math.max(0, 1 - Math.max(0, dxBase - 260) / 480);
@@ -71,8 +62,70 @@ export function groundHeightAt(x: number, z: number): number {
   const smoothBase = baseBlend * baseBlend * (3 - 2 * baseBlend);
 
   h = h * (1 - smoothBase) + 18.0 * smoothBase;
-
   return h;
+}
+
+export interface TimeOfDayAtmosphere {
+  sunDir: THREE.Vector3;
+  sunColor: THREE.Color;
+  sunIntensity: number;
+  hemiIntensity: number;
+  topColor: THREE.Color;
+  midColor: THREE.Color;
+  horColor: THREE.Color;
+  starIntensity: number;
+  twilightTint: THREE.Color;
+}
+
+const TOD_PRESETS: Record<TimeOfDay, TimeOfDayAtmosphere> = {
+  dawn: {
+    sunDir: new THREE.Vector3(0.84, 0.15, -0.52).normalize(),
+    sunColor: new THREE.Color(0xffb478),
+    sunIntensity: 1.85,
+    hemiIntensity: 0.72,
+    topColor: new THREE.Color(0x0f2042),
+    midColor: new THREE.Color(0x4b5d8a),
+    horColor: new THREE.Color(0xe89b72),
+    starIntensity: 0.25,
+    twilightTint: new THREE.Color(0xf97316),
+  },
+  day: {
+    sunDir: new THREE.Vector3(0.55, 0.42, -0.72).normalize(),
+    sunColor: new THREE.Color(0xfff1d6),
+    sunIntensity: 2.3,
+    hemiIntensity: 0.85,
+    topColor: new THREE.Color(0x0b2349),
+    midColor: new THREE.Color(0x3a76b8),
+    horColor: new THREE.Color(0xc8deee),
+    starIntensity: 0.0,
+    twilightTint: new THREE.Color(0xffe4b8),
+  },
+  dusk: {
+    sunDir: new THREE.Vector3(-0.82, 0.12, -0.56).normalize(),
+    sunColor: new THREE.Color(0xff7e47),
+    sunIntensity: 1.6,
+    hemiIntensity: 0.58,
+    topColor: new THREE.Color(0x091229),
+    midColor: new THREE.Color(0x3b3869),
+    horColor: new THREE.Color(0xd96b52),
+    starIntensity: 0.48,
+    twilightTint: new THREE.Color(0xf43f5e),
+  },
+  night: {
+    sunDir: new THREE.Vector3(-0.35, 0.52, -0.78).normalize(),
+    sunColor: new THREE.Color(0x8bb8ff),
+    sunIntensity: 0.78,
+    hemiIntensity: 0.42,
+    topColor: new THREE.Color(0x02050d),
+    midColor: new THREE.Color(0x091529),
+    horColor: new THREE.Color(0x162944),
+    starIntensity: 1.0,
+    twilightTint: new THREE.Color(0x38bdf8),
+  },
+};
+
+export function getTimeOfDayPreset(tod: TimeOfDay): TimeOfDayAtmosphere {
+  return TOD_PRESETS[tod] ?? TOD_PRESETS.day;
 }
 
 export interface WorldEnvironment {
@@ -80,6 +133,8 @@ export interface WorldEnvironment {
   skyMesh: THREE.Mesh;
   waterMesh: THREE.Mesh;
   clouds: VolumetricCloudSystem;
+  getHorizonFogColor: (out: THREE.Color) => THREE.Color;
+  getSunDirection: (out: THREE.Vector3) => THREE.Vector3;
   update: (
     elapsed: number,
     dt: number,
@@ -89,69 +144,17 @@ export interface WorldEnvironment {
     windVecZ: number,
     windSpeedKts: number,
     stormFactor: number,
-    rainIntensity: number
+    rainIntensity: number,
+    timeOfDay?: TimeOfDay
   ) => number;
   dispose: () => void;
 }
 
-export function createWorldEnvironment(
-  mats: SimMaterialLibrary,
-  isSoftwareGl: boolean
-): WorldEnvironment {
-  const group = new THREE.Group();
-  const disposables: Array<{ dispose: () => void }> = [];
+function buildTerrainGeometry(size: number, segments: number): THREE.PlaneGeometry {
+  const geo = new THREE.PlaneGeometry(size, size, segments, segments);
+  geo.rotateX(-Math.PI / 2);
 
-  // 1. Atmospheric Sky Dome Shader (vertical Rayleigh-inspired gradient + sun disk glow)
-  const skyGeo = new THREE.SphereGeometry(28000, 32, 20);
-  const skyMat = new THREE.ShaderMaterial({
-    side: THREE.BackSide,
-    depthWrite: false,
-    uniforms: {
-      uSunDir: { value: new THREE.Vector3(0.55, 0.36, -0.75).normalize() },
-      uTopColor: { value: new THREE.Color(0x0b2349) },
-      uMidColor: { value: new THREE.Color(0x3a76b8) },
-      uHorizonColor: { value: new THREE.Color(0xc8deee) },
-    },
-    vertexShader: `
-      varying vec3 vWorldDir;
-      void main() {
-        vec4 worldPos = modelMatrix * vec4(position, 1.0);
-        vWorldDir = normalize(position);
-        gl_Position = projectionMatrix * viewMatrix * worldPos;
-      }
-    `,
-    fragmentShader: `
-      varying vec3 vWorldDir;
-      uniform vec3 uSunDir;
-      uniform vec3 uTopColor;
-      uniform vec3 uMidColor;
-      uniform vec3 uHorizonColor;
-      void main() {
-        vec3 dir = normalize(vWorldDir);
-        float h = clamp(dir.y, 0.0, 1.0);
-        vec3 col = mix(uHorizonColor, uMidColor, pow(h, 0.45));
-        col = mix(col, uTopColor, smoothstep(0.18, 0.85, h));
-
-        // Sun halo & disk
-        float sunDot = max(dot(dir, uSunDir), 0.0);
-        col += vec3(1.0, 0.88, 0.68) * pow(sunDot, 14.0) * 0.32;
-        col += vec3(1.0, 0.96, 0.86) * smoothstep(0.9988, 0.9997, sunDot) * 1.4;
-        gl_FragColor = vec4(col, 1.0);
-      }
-    `,
-  });
-  const skyMesh = new THREE.Mesh(skyGeo, skyMat);
-  skyMesh.frustumCulled = false;
-  group.add(skyMesh);
-  disposables.push(skyGeo, skyMat);
-
-  // 2. Sculpted Terrain Mesh with Vertex Colors (sand/shore -> scrub/pine -> granite rock -> alpine snow)
-  const segments = isSoftwareGl ? 150 : 210;
-  const terrainSize = WORLD_RADIUS * 2;
-  const terrainGeo = new THREE.PlaneGeometry(terrainSize, terrainSize, segments, segments);
-  terrainGeo.rotateX(-Math.PI / 2);
-
-  const posAttr = terrainGeo.attributes.position as THREE.BufferAttribute;
+  const posAttr = geo.attributes.position as THREE.BufferAttribute;
   const colors = new Float32Array(posAttr.count * 3);
   const cShore = new THREE.Color(0x8e8368);
   const cForest = new THREE.Color(0x2f4938);
@@ -178,25 +181,114 @@ export function createWorldEnvironment(
       tmpColor.copy(cRock).lerp(cSnow, t);
     }
 
-    // Subtle micro variation
     const v = 0.93 + hash2(Math.floor(x * 0.02), Math.floor(z * 0.02)) * 0.14;
     colors[i * 3] = tmpColor.r * v;
     colors[i * 3 + 1] = tmpColor.g * v;
     colors[i * 3 + 2] = tmpColor.b * v;
   }
 
-  terrainGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  terrainGeo.computeVertexNormals();
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  return geo;
+}
 
+export function createWorldEnvironment(
+  mats: SimMaterialLibrary,
+  isSoftwareGl: boolean
+): WorldEnvironment {
+  const group = new THREE.Group();
+  const disposables: Array<{ dispose: () => void }> = [];
+
+  // 1. Dynamic Sky Dome Shader (Dawn/Day/Dusk/Night Rayleigh + Starfield + Sun/Moon Halo)
+  const skyGeo = new THREE.SphereGeometry(28000, 32, 20);
+  const skyMat = new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    depthWrite: false,
+    uniforms: {
+      uSunDir: { value: TOD_PRESETS.day.sunDir.clone() },
+      uTopColor: { value: TOD_PRESETS.day.topColor.clone() },
+      uMidColor: { value: TOD_PRESETS.day.midColor.clone() },
+      uHorizonColor: { value: TOD_PRESETS.day.horColor.clone() },
+      uTwilightColor: { value: TOD_PRESETS.day.twilightTint.clone() },
+      uStarIntensity: { value: 0.0 },
+      uTime: { value: 0.0 },
+    },
+    vertexShader: `
+      varying vec3 vWorldDir;
+      void main() {
+        vec4 worldPos = modelMatrix * vec4(position, 1.0);
+        vWorldDir = normalize(position);
+        gl_Position = projectionMatrix * viewMatrix * worldPos;
+      }
+    `,
+    fragmentShader: `
+      varying vec3 vWorldDir;
+      uniform vec3 uSunDir;
+      uniform vec3 uTopColor;
+      uniform vec3 uMidColor;
+      uniform vec3 uHorizonColor;
+      uniform vec3 uTwilightColor;
+      uniform float uStarIntensity;
+      uniform float uTime;
+
+      float starHash(vec3 p) {
+        p = fract(p * 0.3183099 + 0.1);
+        p *= 17.0;
+        return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+      }
+
+      void main() {
+        vec3 dir = normalize(vWorldDir);
+        float h = clamp(dir.y, 0.0, 1.0);
+        vec3 col = mix(uHorizonColor, uMidColor, pow(h, 0.45));
+        col = mix(col, uTopColor, smoothstep(0.18, 0.85, h));
+
+        // Sun/Moon halo & disk
+        float sunDot = max(dot(dir, normalize(uSunDir)), 0.0);
+        col += uTwilightColor * pow(sunDot, 10.0) * 0.34;
+        col += mix(vec3(1.0, 0.96, 0.86), uTwilightColor, 0.25) * smoothstep(0.9988, 0.9997, sunDot) * 1.35;
+
+        // Crisp upper-hemisphere starfield during Dusk & Night
+        if (uStarIntensity > 0.02 && dir.y > 0.03) {
+          vec3 grid = floor(dir * 260.0);
+          float rnd = starHash(grid);
+          if (rnd > 0.993) {
+            float twinkle = 0.65 + 0.35 * sin(uTime * 2.5 + rnd * 120.0);
+            float mask = smoothstep(0.03, 0.35, dir.y) * uStarIntensity;
+            col += vec3(0.85, 0.92, 1.0) * twinkle * mask * 0.95;
+          }
+        }
+
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `,
+  });
+  const skyMesh = new THREE.Mesh(skyGeo, skyMat);
+  skyMesh.frustumCulled = false;
+  group.add(skyMesh);
+  disposables.push(skyGeo, skyMat);
+
+  // 2. THREE.LOD Terrain Mesh (High-res close theater + Low-poly far fallback)
+  const terrainSize = WORLD_RADIUS * 2;
+  const hiSegs = isSoftwareGl ? 130 : 190;
+  const loSegs = 64;
+  const terrainGeoHi = buildTerrainGeometry(terrainSize, hiSegs);
+  const terrainGeoLo = buildTerrainGeometry(terrainSize, loSegs);
   const terrainMat = new THREE.MeshStandardMaterial({
     vertexColors: true,
     roughness: 0.92,
     metalness: 0.04,
   });
-  const terrainMesh = new THREE.Mesh(terrainGeo, terrainMat);
-  terrainMesh.receiveShadow = true;
-  group.add(terrainMesh);
-  disposables.push(terrainGeo, terrainMat);
+
+  const terrainLod = new THREE.LOD();
+  const terrainHiMesh = new THREE.Mesh(terrainGeoHi, terrainMat);
+  terrainHiMesh.receiveShadow = true;
+  const terrainLoMesh = new THREE.Mesh(terrainGeoLo, terrainMat);
+  terrainLoMesh.receiveShadow = true;
+  terrainLod.addLevel(terrainHiMesh, 0);
+  terrainLod.addLevel(terrainLoMesh, 9500);
+  group.add(terrainLod);
+  disposables.push(terrainGeoHi, terrainGeoLo, terrainMat);
 
   // 3. Ocean Water Plane at y = 0
   const waterGeo = new THREE.PlaneGeometry(terrainSize * 1.4, terrainSize * 1.4, 1, 1);
@@ -207,7 +299,40 @@ export function createWorldEnvironment(
   group.add(waterMesh);
   disposables.push(waterGeo);
 
-  // 4. Coastal Airbase Runway (09R / 27L), Apron, Hangars & Control Tower
+  // 4. GPU InstancedMesh Coastal Alpine Pines & Foliage (single draw call!)
+  const treeCount = isSoftwareGl ? 180 : 420;
+  const treeGeo = new THREE.ConeGeometry(4.2, 19, 6);
+  treeGeo.translate(0, 9.5, 0);
+  const treeMat = new THREE.MeshStandardMaterial({
+    color: 0x264430,
+    roughness: 0.88,
+    metalness: 0.02,
+  });
+  const treeInstanced = new THREE.InstancedMesh(treeGeo, treeMat, treeCount);
+  treeInstanced.receiveShadow = true;
+  const dummy = new THREE.Object3D();
+  let placedTrees = 0;
+  for (let i = 0; i < treeCount * 4 && placedTrees < treeCount; i++) {
+    const px = (hash2(i, 17) - 0.5) * 16000;
+    const pz = (hash2(i, 31) - 0.5) * 16000;
+    // Keep well clear of runway plateau
+    if (Math.abs(px - RUNWAY_CENTER.x) < 620 && Math.abs(pz - RUNWAY_CENTER.z) < 1850) continue;
+    const py = groundHeightAt(px, pz);
+    if (py < 8 || py > 290) continue;
+
+    const s = 0.75 + hash2(i, 53) * 0.95;
+    dummy.position.set(px, py - 0.4, pz);
+    dummy.rotation.set(0, hash2(i, 71) * Math.PI * 2, 0);
+    dummy.scale.set(s, s * (0.9 + hash2(i, 83) * 0.45), s);
+    dummy.updateMatrix();
+    treeInstanced.setMatrixAt(placedTrees++, dummy.matrix);
+  }
+  treeInstanced.count = placedTrees;
+  treeInstanced.instanceMatrix.needsUpdate = true;
+  group.add(treeInstanced);
+  disposables.push(treeGeo, treeMat);
+
+  // 5. Coastal Airbase Runway (09R / 27L), Apron, LOD Hangars & Control Tower
   const runwayGeo = new THREE.PlaneGeometry(RUNWAY_WIDTH, RUNWAY_LENGTH);
   runwayGeo.rotateX(-Math.PI / 2);
   const runwayMesh = new THREE.Mesh(runwayGeo, mats.runwayAsphalt);
@@ -216,7 +341,6 @@ export function createWorldEnvironment(
   group.add(runwayMesh);
   disposables.push(runwayGeo);
 
-  // Apron & Hangars alongside runway
   const apronGeo = new THREE.BoxGeometry(110, 0.4, 620);
   const apronMesh = new THREE.Mesh(apronGeo, mats.concreteApron);
   apronMesh.position.set(RUNWAY_CENTER.x + 125, 18.02, RUNWAY_CENTER.z);
@@ -224,15 +348,29 @@ export function createWorldEnvironment(
   group.add(apronMesh);
   disposables.push(apronGeo);
 
-  const hangarGeo = new THREE.BoxGeometry(44, 15, 64);
+  const hangarHiGeo = new THREE.BoxGeometry(44, 15, 64);
+  const hangarRoofGeo = new THREE.CylinderGeometry(22, 22, 64, 10, 1, false, 0, Math.PI);
+  hangarRoofGeo.rotateZ(Math.PI / 2);
+  hangarRoofGeo.rotateY(Math.PI / 2);
   const hangarMat = new THREE.MeshStandardMaterial({ color: 0x4b5563, roughness: 0.65, metalness: 0.3 });
-  disposables.push(hangarGeo, hangarMat);
+  const hangarLoGeo = new THREE.BoxGeometry(44, 18, 64);
+  disposables.push(hangarHiGeo, hangarRoofGeo, hangarLoGeo, hangarMat);
+
   for (let i = -1; i <= 1; i++) {
-    const hangar = new THREE.Mesh(hangarGeo, hangarMat);
-    hangar.position.set(RUNWAY_CENTER.x + 155, 18 + 7.5, RUNWAY_CENTER.z + i * 160);
-    hangar.castShadow = true;
-    hangar.receiveShadow = true;
-    group.add(hangar);
+    const lod = new THREE.LOD();
+    const hiG = new THREE.Group();
+    const base = new THREE.Mesh(hangarHiGeo, hangarMat);
+    base.castShadow = true;
+    base.receiveShadow = true;
+    const roof = new THREE.Mesh(hangarRoofGeo, hangarMat);
+    roof.position.y = 7.5;
+    hiG.add(base, roof);
+
+    const loMesh = new THREE.Mesh(hangarLoGeo, hangarMat);
+    lod.addLevel(hiG, 0);
+    lod.addLevel(loMesh, 2200);
+    lod.position.set(RUNWAY_CENTER.x + 155, 18 + 7.5, RUNWAY_CENTER.z + i * 160);
+    group.add(lod);
   }
 
   // Control tower
@@ -243,7 +381,7 @@ export function createWorldEnvironment(
     roughness: 0.15,
     metalness: 0.75,
     emissive: 0x0369a1,
-    emissiveIntensity: 0.35,
+    emissiveIntensity: 0.45,
   });
   const towerShaft = new THREE.Mesh(towerShaftGeo, hangarMat);
   towerShaft.position.set(RUNWAY_CENTER.x + 145, 18 + 21, RUNWAY_CENTER.z - 280);
@@ -253,7 +391,27 @@ export function createWorldEnvironment(
   group.add(towerShaft, towerCab);
   disposables.push(towerShaftGeo, towerCabGeo, towerCabMat);
 
-  // 5. Dynamic 3D Runway Windsocks (swivel downwind & billow with wind speed)
+  // Instanced Runway Edge Beacons (amber/white lights visible strongly at dusk/night)
+  const edgeLightCount = 32;
+  const edgeLightGeo = new THREE.BoxGeometry(0.9, 0.55, 0.9);
+  const edgeLightMat = new THREE.MeshBasicMaterial({ color: 0xfef08a });
+  const edgeLights = new THREE.InstancedMesh(edgeLightGeo, edgeLightMat, edgeLightCount);
+  let elIdx = 0;
+  for (let side of [-1, 1]) {
+    for (let k = 0; k < 16; k++) {
+      const lz = RUNWAY_CENTER.z - RUNWAY_LENGTH * 0.46 + (k / 15) * (RUNWAY_LENGTH * 0.92);
+      dummy.position.set(RUNWAY_CENTER.x + side * (RUNWAY_WIDTH * 0.5 + 1.5), 18.4, lz);
+      dummy.rotation.set(0, 0, 0);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      edgeLights.setMatrixAt(elIdx++, dummy.matrix);
+    }
+  }
+  edgeLights.instanceMatrix.needsUpdate = true;
+  group.add(edgeLights);
+  disposables.push(edgeLightGeo, edgeLightMat);
+
+  // 6. Dynamic 3D Runway Windsocks
   const poleMat = new THREE.MeshStandardMaterial({ color: 0xcbd5e1, roughness: 0.45, metalness: 0.7 });
   const sockOrangeMat = new THREE.MeshStandardMaterial({ color: 0xf97316, roughness: 0.65, metalness: 0.05 });
   const sockWhiteMat = new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.65, metalness: 0.05 });
@@ -297,10 +455,10 @@ export function createWorldEnvironment(
     windsocks.push({ swivel, segments });
   }
 
-  // 6. Runway Threshold & 4-Box PAPI Precision Glideslope Lights (both ends)
+  // 7. Runway Threshold & 4-Box PAPI Precision Glideslope Lights
   const papiThresholds = [
-    { z: RUNWAY_CENTER.z + RUNWAY_LENGTH * 0.5 - 160, approachDirZ: 1 }, // South threshold (landing North 000°)
-    { z: RUNWAY_CENTER.z - RUNWAY_LENGTH * 0.5 + 160, approachDirZ: -1 }, // North threshold (landing South 180°)
+    { z: RUNWAY_CENTER.z + RUNWAY_LENGTH * 0.5 - 160, approachDirZ: 1 },
+    { z: RUNWAY_CENTER.z - RUNWAY_LENGTH * 0.5 + 160, approachDirZ: -1 },
   ];
   const papiMatWhite = new THREE.MeshBasicMaterial({ color: 0xfefce8 });
   const papiMatRed = new THREE.MeshBasicMaterial({ color: 0xef4444 });
@@ -316,13 +474,11 @@ export function createWorldEnvironment(
   }
   const papiBanks: PapiBank[] = [];
   for (const thr of papiThresholds) {
-    // Threshold green edge lights
     for (let k = -3; k <= 3; k++) {
       const l = new THREE.Mesh(thrLightGeo, thrGreenMat);
       l.position.set(RUNWAY_CENTER.x + k * 9.5, 18.6, thr.z + thr.approachDirZ * 140);
       group.add(l);
     }
-    // 4-Box PAPI array to port side of runway
     const boxes: THREE.Mesh[] = [];
     for (let b = 0; b < 4; b++) {
       const box = new THREE.Mesh(papiBoxGeo, b < 2 ? papiMatWhite : papiMatRed);
@@ -333,22 +489,26 @@ export function createWorldEnvironment(
     papiBanks.push({ thrZ: thr.z, approachDirZ: thr.approachDirZ, boxes });
   }
 
-  // 7. Dynamic Multi-Altitude Volumetric Cloud Layers, Rain Streaks & Fly-Through Wisps
+  // 8. Dynamic Multi-Altitude Volumetric Cloud Layers & Rain
   const clouds = createVolumetricCloudSystem(isSoftwareGl);
   group.add(clouds.group);
 
-  const _cClearTop = new THREE.Color(0x0b2349);
-  const _cClearMid = new THREE.Color(0x3a76b8);
-  const _cClearHor = new THREE.Color(0xc8deee);
   const _cStormTop = new THREE.Color(0x1b2638);
   const _cStormMid = new THREE.Color(0x41536a);
   const _cStormHor = new THREE.Color(0x7e90a4);
+  const _curTop = TOD_PRESETS.day.topColor.clone();
+  const _curMid = TOD_PRESETS.day.midColor.clone();
+  const _curHor = TOD_PRESETS.day.horColor.clone();
+  const _curTwilight = TOD_PRESETS.day.twilightTint.clone();
+  const _curSunDir = TOD_PRESETS.day.sunDir.clone();
 
   return {
     group,
     skyMesh,
     waterMesh,
     clouds,
+    getHorizonFogColor: (out: THREE.Color) => out.copy(skyMat.uniforms.uHorizonColor.value as THREE.Color),
+    getSunDirection: (out: THREE.Vector3) => out.copy(_curSunDir),
     update: (
       elapsed: number,
       dt: number,
@@ -358,12 +518,30 @@ export function createWorldEnvironment(
       windVecZ: number,
       windSpeedKts: number,
       stormFactor: number,
-      rainIntensity: number
+      rainIntensity: number,
+      timeOfDay: TimeOfDay = 'day'
     ): number => {
+      const tod = TOD_PRESETS[timeOfDay] ?? TOD_PRESETS.day;
+      const lerpAlpha = Math.min(1, dt * 1.4);
+
+      _curSunDir.lerp(tod.sunDir, lerpAlpha).normalize();
+      _curTop.lerp(tod.topColor, lerpAlpha);
+      _curMid.lerp(tod.midColor, lerpAlpha);
+      _curHor.lerp(tod.horColor, lerpAlpha);
+      _curTwilight.lerp(tod.twilightTint, lerpAlpha);
+
       skyMesh.position.copy(cameraPos);
-      skyMat.uniforms.uTopColor.value.copy(_cClearTop).lerp(_cStormTop, stormFactor);
-      skyMat.uniforms.uMidColor.value.copy(_cClearMid).lerp(_cStormMid, stormFactor);
-      skyMat.uniforms.uHorizonColor.value.copy(_cClearHor).lerp(_cStormHor, stormFactor);
+      (skyMat.uniforms.uSunDir.value as THREE.Vector3).copy(_curSunDir);
+      skyMat.uniforms.uTopColor.value.copy(_curTop).lerp(_cStormTop, stormFactor * 0.72);
+      skyMat.uniforms.uMidColor.value.copy(_curMid).lerp(_cStormMid, stormFactor * 0.72);
+      skyMat.uniforms.uHorizonColor.value.copy(_curHor).lerp(_cStormHor, stormFactor * 0.72);
+      skyMat.uniforms.uTwilightColor.value.copy(_curTwilight);
+      skyMat.uniforms.uStarIntensity.value = THREE.MathUtils.lerp(
+        skyMat.uniforms.uStarIntensity.value,
+        tod.starIntensity * (1 - stormFactor * 0.8),
+        lerpAlpha
+      );
+      skyMat.uniforms.uTime.value = elapsed;
 
       if (mats.oceanWater.normalMap) {
         const waveScale = 0.01 + windSpeedKts * 0.0005;
@@ -371,10 +549,9 @@ export function createWorldEnvironment(
         mats.oceanWater.normalMap.offset.y = (elapsed * waveScale * 0.75) % 1;
       }
 
-      // Animate 3D runway windsocks pointing downwind & fluttering with gusts
       const windDownAngle = Math.atan2(windVecX, windVecZ);
       const extension = THREE.MathUtils.clamp(windSpeedKts / 26, 0.15, 1.0);
-      const droopPitch = (1 - extension) * 0.36; // positive X rotation droops +Z tip down
+      const droopPitch = (1 - extension) * 0.36;
       for (let w = 0; w < windsocks.length; w++) {
         const rig = windsocks[w];
         rig.swivel.rotation.y = windDownAngle + Math.sin(elapsed * 2.1 + w) * (0.04 + extension * 0.07);
@@ -385,8 +562,6 @@ export function createWorldEnvironment(
         }
       }
 
-      // Update 4-Box PAPI glideslope beacons relative to aircraft position
-      // Threshold cuts: 3.5 deg, 3.17 deg, 2.83 deg, 2.5 deg (innermost = steepest white threshold)
       const cutoffs = [2.5, 2.83, 3.17, 3.5];
       for (const bank of papiBanks) {
         const distAlong = (aircraftPos.z - bank.thrZ) * bank.approachDirZ;
@@ -405,7 +580,9 @@ export function createWorldEnvironment(
         windVecX,
         windVecZ,
         stormFactor,
-        rainIntensity
+        rainIntensity,
+        _curSunDir,
+        skyMat.uniforms.uHorizonColor.value as THREE.Color
       );
     },
     dispose: () => {

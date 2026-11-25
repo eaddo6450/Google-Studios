@@ -24,7 +24,7 @@ export interface WeatherSnapshot {
 }
 
 export interface WeatherSystem {
-  reset: () => void;
+  reset: (initialRegime?: WeatherRegime) => void;
   update: (dt: number, elapsed: number) => void;
   sampleWindAt: (
     pos: THREE.Vector3,
@@ -200,19 +200,21 @@ export function createWeatherSystem(): WeatherSystem {
     shiftAnnounceTimer = 7.5;
   };
 
-  const reset = () => {
+  const reset = (initialRegime?: WeatherRegime) => {
+    const startRegime: WeatherRegime = initialRegime && PRESETS[initialRegime] ? initialRegime : 'BREEZY';
+    const preset = PRESETS[startRegime];
     seqIdx = 0;
-    currentRegime = 'BREEZY';
-    currentLabel = PRESETS.BREEZY.label;
-    windFromDeg = 278;
-    windSpeedKts = 21;
-    gustRatio = PRESETS.BREEZY.gustRatio;
-    stormFactor = PRESETS.BREEZY.stormFactor;
-    rainIntensity = PRESETS.BREEZY.rainIntensity;
-    turbulenceLevel = PRESETS.BREEZY.turbulence;
+    currentRegime = startRegime;
+    currentLabel = preset.label;
+    windFromDeg = startRegime === 'CLEAR' ? 245 : startRegime === 'STORM' ? 295 : 278;
+    windSpeedKts = Math.round((preset.minKts + preset.maxKts) * 0.5);
+    gustRatio = preset.gustRatio;
+    stormFactor = preset.stormFactor;
+    rainIntensity = preset.rainIntensity;
+    turbulenceLevel = preset.turbulence;
 
-    targetWindFromDeg = 278;
-    targetWindSpeedKts = 21;
+    targetWindFromDeg = windFromDeg;
+    targetWindSpeedKts = windSpeedKts;
     targetGustRatio = gustRatio;
     targetStormFactor = stormFactor;
     targetRainIntensity = rainIntensity;

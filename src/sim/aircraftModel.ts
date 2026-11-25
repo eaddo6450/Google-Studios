@@ -567,10 +567,10 @@ export function createPlayerFighterModel(
   tailhook.position.set(0, -0.48, 4.4);
   root.add(tailhook);
 
-  // 8. Petaled Variable-Geometry Engine Nozzles + Afterburner Plumes
+  // 8. Petaled Variable-Geometry Engine Nozzles + Custom GLSL Shock-Diamond Exhaust Shaders
   const nozzleXOffset = aircraftId === 'f14' ? 0.96 : aircraftId === 'typhoon' ? 0.52 : 0.68;
   const nozzleRadius = spec.twinEngine ? 0.54 : 0.72;
-  const nozControls: Array<{ petalRing: THREE.Group; abGroup: THREE.Group }> = [];
+  const nozControls: Array<{ petalRing: THREE.Group; abGroup: THREE.Group; abShader: THREE.ShaderMaterial }> = [];
 
   const buildEngineRig = (xPos: number) => {
     const noz = createNozzleGroup(mats, nozzleRadius, disposables);
@@ -578,27 +578,20 @@ export function createPlayerFighterModel(
     root.add(noz.group);
 
     const abG = new THREE.Group();
-    abG.position.set(xPos, 0.0, 6.05);
-    const plumeRad = spec.twinEngine ? 0.36 : 0.48;
-    const coreGeo = track(new THREE.ConeGeometry(plumeRad, 4.2, 14).rotateX(Math.PI / 2));
-    coreGeo.translate(0, 0, 2.1);
-    const core = new THREE.Mesh(coreGeo, mats.afterburnerCore);
+    abG.position.set(xPos, 0.0, 6.0);
+    const plumeRad = spec.twinEngine ? 0.44 : 0.58;
+    const abShader = trackMat(mats.createExhaustShaderMaterial('jet'));
+    const plumeGeo = track(new THREE.CylinderGeometry(0.06, plumeRad, 5.8, 18, 1, true).rotateX(Math.PI / 2));
+    plumeGeo.translate(0, 0, 2.9);
+    const outerPlume = new THREE.Mesh(plumeGeo, abShader);
 
-    const haloGeo = track(new THREE.ConeGeometry(plumeRad * 1.55, 6.4, 16, 1, true).rotateX(Math.PI / 2));
-    haloGeo.translate(0, 0, 3.2);
-    const halo = new THREE.Mesh(haloGeo, mats.afterburnerHalo);
+    const innerGeo = track(new THREE.CylinderGeometry(0.04, plumeRad * 0.62, 3.8, 14, 1, true).rotateX(Math.PI / 2));
+    innerGeo.translate(0, 0, 1.9);
+    const innerCore = new THREE.Mesh(innerGeo, abShader);
 
-    const diamondGeo = track(new THREE.OctahedronGeometry(plumeRad * 0.68, 0));
-    for (let i = 0; i < 4; i++) {
-      const d = new THREE.Mesh(diamondGeo, mats.afterburnerCore);
-      d.position.z = 0.8 + i * 1.15;
-      d.scale.set(1 - i * 0.16, 1 - i * 0.16, 1.5);
-      abG.add(d);
-    }
-
-    abG.add(core, halo);
+    abG.add(outerPlume, innerCore);
     root.add(abG);
-    nozControls.push({ petalRing: noz.petalRing, abGroup: abG });
+    nozControls.push({ petalRing: noz.petalRing, abGroup: abG, abShader });
   };
 
   if (spec.twinEngine) {
@@ -869,6 +862,12 @@ export function createPlayerFighterModel(
         const dmgScale = isPort && isDamaged ? 0.55 : !isPort && stbdSputter ? 0.45 : 1;
         nc.abGroup.scale.set(radScale, radScale, lenScale * dmgScale);
         nc.abGroup.visible = engineActive && !flamedOut;
+
+        nc.abShader.uniforms.uTime.value = elapsed;
+        nc.abShader.uniforms.uMach.value = mach;
+        nc.abShader.uniforms.uPower.value = afterburner
+          ? (1.05 + (throttle01 - 0.8) * 1.1) * dmgScale
+          : throttle01 * 0.48 * dmgScale;
       });
 
       if (isDamaged) {
@@ -964,25 +963,30 @@ export function createPlayerFighterModel(
 }
 
 export function createEnemyFighterModel(mats: SimMaterialLibrary): {
-  root: THREE.Group;
+  root: THREE.LOD;
   abLeft: THREE.Mesh;
   abRight: THREE.Mesh;
+  abShader: THREE.ShaderMaterial;
   dispose: () => void;
 } {
-  const root = new THREE.Group();
+  const root = new THREE.LOD();
+  const hiDetail = new THREE.Group();
+  const lowDetail = new THREE.Group();
   const disposables: Array<{ dispose: () => void }> = [];
   const track = <T extends THREE.BufferGeometry>(g: T): T => {
     disposables.push(g);
     return g;
   };
+  const abShader = mats.createExhaustShaderMaterial('jet');
+  disposables.push(abShader);
 
-  // Su-27 / MiG-29 Aggressor silhouette with recessed intakes, pitot nose, nav lights & red accents
+  // --- LOD 0: Detailed Su-27 / MiG-29 Aggressor Airframe (< 1300m) ---
   const hull = new THREE.Mesh(
     track(new THREE.BoxGeometry(1.7, 0.72, 9.6)),
     mats.enemyFuselage
   );
   hull.castShadow = true;
-  root.add(hull);
+  hiDetail.add(hull);
 
   const nose = new THREE.Mesh(
     track(new THREE.ConeGeometry(0.68, 4.4, 14).rotateX(-Math.PI / 2)),
@@ -990,23 +994,22 @@ export function createEnemyFighterModel(mats: SimMaterialLibrary): {
   );
   nose.scale.set(1.1, 0.72, 1);
   nose.position.set(0, 0.02, -6.9);
-  root.add(nose);
+  hiDetail.add(nose);
 
   const radome = new THREE.Mesh(
     track(new THREE.ConeGeometry(0.24, 1.1, 12).rotateX(-Math.PI / 2)),
     mats.enemyAccent
   );
   radome.position.set(0, 0.0, -9.2);
-  root.add(radome);
+  hiDetail.add(radome);
 
   const pitot = new THREE.Mesh(
     track(new THREE.CylinderGeometry(0.015, 0.026, 0.85, 8).rotateX(Math.PI / 2)),
     mats.titaniumNozzle
   );
   pitot.position.set(0, 0.0, -10.1);
-  root.add(pitot);
+  hiDetail.add(pitot);
 
-  // Recessed twin intakes
   const intakeGeo = track(new THREE.BoxGeometry(0.62, 0.45, 3.8));
   const cavGeo = track(new THREE.BoxGeometry(0.48, 0.34, 0.35));
   for (const side of [-1, 1]) {
@@ -1014,18 +1017,16 @@ export function createEnemyFighterModel(mats: SimMaterialLibrary): {
     iBox.position.set(side * 0.88, -0.28, -2.0);
     const cav = new THREE.Mesh(cavGeo, mats.intakeDark);
     cav.position.set(side * 0.88, -0.28, -3.85);
-    root.add(iBox, cav);
+    hiDetail.add(iBox, cav);
   }
 
-  // Canopy
   const canopy = new THREE.Mesh(
     track(new THREE.SphereGeometry(0.55, 14, 10)).scale(0.78, 0.68, 2.3),
     mats.canopyGlass
   );
   canopy.position.set(0, 0.56, -3.5);
-  root.add(canopy);
+  hiDetail.add(canopy);
 
-  // Swept wings
   const wingL = new THREE.Mesh(
     track(createSweptWingGeometry(4.0, 1.1, 5.4, 2.7, 0.16, -1)),
     mats.enemyFuselage
@@ -1038,23 +1039,21 @@ export function createEnemyFighterModel(mats: SimMaterialLibrary): {
   );
   wingR.position.set(0.85, 0.0, 0.4);
   wingR.castShadow = true;
-  root.add(wingL, wingR);
+  hiDetail.add(wingL, wingR);
 
-  // Aggressor red wingtips & nav lights
   const tipGeo = track(new THREE.BoxGeometry(0.75, 0.12, 1.1));
   const tipL = new THREE.Mesh(tipGeo, mats.enemyAccent);
   tipL.position.set(-6.0, 0.08, 3.0);
   const tipR = new THREE.Mesh(tipGeo, mats.enemyAccent);
   tipR.position.set(6.0, 0.08, 3.0);
-  root.add(tipL, tipR);
+  hiDetail.add(tipL, tipR);
 
-  // Twin vertical fins + horizontal stabs
   const finGeo = track(createFinGeometry(2.1, 0.75, 2.35, 1.1, 0.1));
   const finL = new THREE.Mesh(finGeo, mats.enemyAccent);
   finL.position.set(-1.05, 0.35, 4.1);
   const finR = new THREE.Mesh(finGeo, mats.enemyAccent);
   finR.position.set(1.05, 0.35, 4.1);
-  root.add(finL, finR);
+  hiDetail.add(finL, finR);
 
   const stabL = new THREE.Mesh(
     track(createSweptWingGeometry(1.9, 0.65, 2.4, 1.1, 0.11, -1)),
@@ -1066,29 +1065,101 @@ export function createEnemyFighterModel(mats: SimMaterialLibrary): {
     mats.enemyFuselage
   );
   stabR.position.set(0.85, 0.0, 4.6);
-  root.add(stabL, stabR);
+  hiDetail.add(stabL, stabR);
 
-  // Twin engine nozzles + plumes
   const nozL = createNozzleGroup(mats, 0.52, disposables);
   nozL.group.position.set(-0.66, 0, 4.6);
   const nozR = createNozzleGroup(mats, 0.52, disposables);
   nozR.group.position.set(0.66, 0, 4.6);
-  root.add(nozL.group, nozR.group);
+  hiDetail.add(nozL.group, nozR.group);
 
-  const abGeo = track(new THREE.ConeGeometry(0.36, 4.4, 12).rotateX(Math.PI / 2));
-  abGeo.translate(0, 0, 2.2);
-  const abLeft = new THREE.Mesh(abGeo, mats.afterburnerHalo);
-  abLeft.position.set(-0.66, 0, 5.9);
-  const abRight = new THREE.Mesh(abGeo, mats.afterburnerHalo);
-  abRight.position.set(0.66, 0, 5.9);
-  root.add(abLeft, abRight);
+  const abGeo = track(new THREE.CylinderGeometry(0.05, 0.42, 4.8, 12, 1, true).rotateX(Math.PI / 2));
+  abGeo.translate(0, 0, 2.4);
+  const abLeft = new THREE.Mesh(abGeo, abShader);
+  abLeft.position.set(-0.66, 0, 5.85);
+  const abRight = new THREE.Mesh(abGeo, abShader);
+  abRight.position.set(0.66, 0, 5.85);
+  hiDetail.add(abLeft, abRight);
+
+  // --- LOD 1: Distant BVR Aggressor Silhouette (>= 1300m) ---
+  const lowHull = new THREE.Mesh(track(new THREE.BoxGeometry(1.7, 0.72, 12.5)), mats.enemyFuselage);
+  const lowWing = new THREE.Mesh(track(new THREE.BoxGeometry(12.2, 0.18, 3.2)), mats.enemyAccent);
+  lowWing.position.set(0, 0, 0.8);
+  const lowTail = new THREE.Mesh(track(new THREE.BoxGeometry(2.2, 2.4, 1.6)), mats.enemyAccent);
+  lowTail.position.set(0, 1.2, 4.5);
+  const lowGlow = new THREE.Mesh(track(new THREE.ConeGeometry(0.65, 4.5, 6).rotateX(Math.PI / 2)), mats.afterburnerHalo);
+  lowGlow.position.set(0, 0, 8.2);
+  lowDetail.add(lowHull, lowWing, lowTail, lowGlow);
+
+  root.addLevel(hiDetail, 0);
+  root.addLevel(lowDetail, 1300);
 
   return {
     root,
     abLeft,
     abRight,
+    abShader,
     dispose: () => {
       disposables.forEach((d) => d.dispose());
     },
   };
 }
+
+export function createAlliedTransportModel(mats: SimMaterialLibrary): {
+  root: THREE.Group;
+  dispose: () => void;
+} {
+  const root = new THREE.Group();
+  const disposables: Array<{ dispose: () => void }> = [];
+  const track = <T extends THREE.BufferGeometry>(g: T): T => {
+    disposables.push(g);
+    return g;
+  };
+
+  // Large friendly KC-130V / Tanker Escort Aircraft
+  const fuselage = new THREE.Mesh(
+    track(new THREE.CylinderGeometry(1.75, 1.65, 22, 14).rotateX(Math.PI / 2)),
+    mats.missileBody
+  );
+  fuselage.castShadow = true;
+  root.add(fuselage);
+
+  const nose = new THREE.Mesh(
+    track(new THREE.SphereGeometry(1.72, 12, 10)).scale(1, 0.95, 1.6),
+    mats.playerRamTrim
+  );
+  nose.position.set(0, -0.1, -11.0);
+  root.add(nose);
+
+  const wing = new THREE.Mesh(track(new THREE.BoxGeometry(28, 0.38, 4.4)), mats.playerFuselage);
+  wing.position.set(0, 1.35, -1.5);
+  wing.castShadow = true;
+  root.add(wing);
+
+  const hTail = new THREE.Mesh(track(new THREE.BoxGeometry(10.5, 0.24, 2.2)), mats.playerFuselage);
+  hTail.position.set(0, 1.1, 10.0);
+  const vTail = new THREE.Mesh(track(new THREE.BoxGeometry(0.32, 5.2, 3.6)), mats.navGreen);
+  vTail.position.set(0, 3.4, 9.6);
+  root.add(hTail, vTail);
+
+  const podGeo = track(new THREE.CylinderGeometry(0.45, 0.45, 3.4, 10).rotateX(Math.PI / 2));
+  for (const x of [-8.8, -4.6, 4.6, 8.8]) {
+    const pod = new THREE.Mesh(podGeo, mats.titaniumNozzle);
+    pod.position.set(x, 0.85, -2.1);
+    root.add(pod);
+  }
+
+  const beaconPort = new THREE.Mesh(track(new THREE.SphereGeometry(0.32, 8, 6)), mats.navRed);
+  beaconPort.position.set(-14.0, 1.45, -1.5);
+  const beaconStbd = new THREE.Mesh(track(new THREE.SphereGeometry(0.32, 8, 6)), mats.navGreen);
+  beaconStbd.position.set(14.0, 1.45, -1.5);
+  root.add(beaconPort, beaconStbd);
+
+  return {
+    root,
+    dispose: () => {
+      disposables.forEach((d) => d.dispose());
+    },
+  };
+}
+

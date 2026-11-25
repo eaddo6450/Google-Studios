@@ -4,6 +4,79 @@ export type CameraMode = 'chase' | 'cockpit' | 'cinematic';
 export type WeaponType = 'missile_ir' | 'missile_radar';
 export type AircraftId = 'f22' | 'f16' | 'f14' | 'typhoon';
 export type WeatherRegime = 'CLEAR' | 'BREEZY' | 'SQUALL' | 'STORM';
+export type TimeOfDay = 'dawn' | 'day' | 'dusk' | 'night';
+export type MissionType = 'destroy' | 'escort' | 'recon';
+
+export interface MissionWaypoint {
+  id: string;
+  label: string;
+  x: number;
+  y: number;
+  z: number;
+  radius: number;
+  completed: boolean;
+}
+
+export interface MissionSpec {
+  id: string;
+  title: string;
+  briefing: string;
+  objectiveType: MissionType;
+  timeOfDay: TimeOfDay;
+  weatherRegime: WeatherRegime;
+  enemyCount: number;
+  difficultyMultiplier: number;
+  targetName: string;
+  sectorLabel: string;
+  waypoints: MissionWaypoint[];
+  isAiGenerated?: boolean;
+}
+
+export interface GraphicsSettings {
+  renderScale: number; // 0.5 .. 1.25
+  bloomEnabled: boolean;
+  motionBlurEnabled: boolean;
+  aaEnabled: boolean;
+  experimentalWebGpu: boolean;
+}
+
+export type ControlAction =
+  | 'pitchUp'
+  | 'pitchDown'
+  | 'rollLeft'
+  | 'rollRight'
+  | 'yawLeft'
+  | 'yawRight'
+  | 'throttleUp'
+  | 'throttleDown'
+  | 'afterburner'
+  | 'airbrake'
+  | 'fireGun'
+  | 'fireMissile'
+  | 'flare'
+  | 'gear'
+  | 'cycleTarget'
+  | 'cycleCamera';
+
+export type ControlBindings = Record<ControlAction, string>;
+
+export interface RadioMessage {
+  id: string;
+  speaker: string;
+  channel: 'AWACS' | 'WINGMAN' | 'HOSTILE' | 'COMMAND';
+  tone: 'info' | 'warn' | 'alert' | 'hostile';
+  text: string;
+  timestampSec: number;
+}
+
+export interface AdaptiveDifficultyProfile {
+  skillTier: 'ROOKIE' | 'VETERAN' | 'ACE';
+  aiTurnScale: number;
+  aiMissileCooldownScale: number;
+  aiAggression: number;
+  waveSizeDelta: number;
+  coachingNote: string;
+}
 
 export interface ProjectedTarget {
   id: string;
@@ -21,6 +94,18 @@ export interface ProjectedTarget {
   leadValid: boolean;
   isLockingPlayer: boolean;
   relBearingRad: number; // for radar scope
+  aiMode?: string;
+}
+
+export interface ProjectedWaypoint {
+  id: string;
+  label: string;
+  x: number;
+  y: number;
+  inFront: boolean;
+  distanceMeters: number;
+  kind: 'recon' | 'escort' | 'strike';
+  completed: boolean;
 }
 
 export interface RadarBlip {
@@ -30,6 +115,24 @@ export interface RadarBlip {
   isLocked: boolean;
   isMissile: boolean;
   isFriendlyRunway?: boolean;
+  isAlly?: boolean;
+  isObjective?: boolean;
+}
+
+export type SimCommsEventType =
+  | 'mission_start'
+  | 'splash'
+  | 'hull_low'
+  | 'missile_inbound'
+  | 'enemy_retreat'
+  | 'escort_under_fire'
+  | 'recon_waypoint'
+  | 'weather_shift'
+  | 'mission_victory';
+
+export interface SimEventPayload {
+  type: SimCommsEventType;
+  detail: string;
 }
 
 export interface HudTelemetry {
@@ -77,6 +180,7 @@ export interface HudTelemetry {
   mouseAimX: number; // Mouse aim cursor screen px
   mouseAimY: number;
   targets: ProjectedTarget[];
+  projectedWaypoints: ProjectedWaypoint[];
   radarBlips: RadarBlip[];
   cameraMode: CameraMode;
   controlMode: ControlMode;
@@ -91,6 +195,7 @@ export interface HudTelemetry {
   flightTimeSec: number;
   shotsFired: number;
   shotsHit: number;
+  glocCount: number;
   // Dynamic weather & landing system
   weatherRegime: WeatherRegime;
   weatherLabel: string;
@@ -111,4 +216,16 @@ export interface HudTelemetry {
   crosswindKts: number; // signed crosswind relative to runway (+ from right)
   headwindKts: number; // positive = headwind, negative = tailwind
   verticalSpeedFpm: number;
+  // Mission, Performance & Time-of-Day
+  fps: number;
+  renderScaleActual: number;
+  webGpuSupported: boolean;
+  webGpuFlagActive: boolean;
+  timeOfDay: TimeOfDay;
+  missionTitle: string;
+  missionType: MissionType;
+  missionObjectiveText: string;
+  missionProgressPct: number;
+  escortHullPct: number | null;
+  skillTier: AdaptiveDifficultyProfile['skillTier'];
 }

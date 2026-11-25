@@ -1,13 +1,25 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { getAircraftSpec, type AircraftSpec } from './aircraftCatalog';
-import { createPlayerFighterModel, type FighterVisualRig } from './aircraftModel';
+import {
+  createAlliedTransportModel,
+  createPlayerFighterModel,
+  type FighterVisualRig,
+} from './aircraftModel';
 import { spawnEnemyWave, updateEnemyAi, type EnemyAircraft } from './ai';
 import { AviationAudio } from './audio';
 import { cloudDensityAtAltitude } from './clouds';
+import {
+  DEFAULT_CONTROL_BINDINGS,
+  DEFAULT_DIFFICULTY_PROFILE,
+  DEFAULT_GRAPHICS_SETTINGS,
+  PRESET_MISSIONS,
+} from './defaults';
 import { createMaterialLibrary, type SimMaterialLibrary } from './materials';
 import {
   createInitialAircraftState,
+  createSmoothedControlState,
+  smoothControlInputs,
   stepAircraftPhysics,
   type AircraftPhysicsState,
   type ControlInputs,
@@ -15,6 +27,7 @@ import {
 import { createPostProcessingPipeline, type PostProcessingPipeline } from './postprocessing';
 import {
   createWorldEnvironment,
+  getTimeOfDayPreset,
   groundHeightAt,
   RUNWAY_CENTER,
   RUNWAY_LENGTH,
@@ -22,19 +35,26 @@ import {
   type WorldEnvironment,
 } from './terrain';
 import type {
+  AdaptiveDifficultyProfile,
   AircraftId,
   CameraMode,
+  ControlBindings,
   ControlMode,
   GamePhase,
+  GraphicsSettings,
   HudTelemetry,
+  MissionSpec,
   ProjectedTarget,
+  ProjectedWaypoint,
   RadarBlip,
+  SimEventPayload,
+  TimeOfDay,
   WeaponType,
 } from './types';
 import { computeGunLeadPoint, WeaponsSystem } from './weapons';
 import { createWeatherSystem, type TurbulenceSample, type WeatherSystem } from './weather';
 
-// Pre-allocated math helpers for zero GC in loop
+// Pre-allocated math helpers for zero GC in 60fps loop
 const _camTargetPos = new THREE.Vector3();
 const _camLookAt = new THREE.Vector3();
 const _camUp = new THREE.Vector3();
@@ -47,10 +67,13 @@ const _v3 = new THREE.Vector3();
 const _proj = new THREE.Vector3();
 const _leadWorld = new THREE.Vector3();
 const _windVec = new THREE.Vector3();
+const _sunDir = new THREE.Vector3();
 const _turbSample: TurbulenceSample = { pitch: 0, roll: 0, yaw: 0 };
 const _euler = new THREE.Euler();
+const _lookMat = new THREE.Matrix4();
+const _worldUp = new THREE.Vector3(0, 1, 0);
+const _origin = new THREE.Vector3(0, 0, 0);
 const _clearFogColor = new THREE.Color(0xc4dbed);
-const _stormFogColor = new THREE.Color(0x6d7f93);
 const _cloudFogColor = new THREE.Color(0xe6eff6);
 const _stratFogColor = new THREE.Color(0x9bc0e3);
 
@@ -60,6 +83,7 @@ export class JetSimulatorEngine {
   private scene: THREE.Scene;
   private camera: THREE.PerspectiveCamera;
   private sunLight: THREE.DirectionalLight;
+  private hemiLight: THREE.HemisphereLight;
   private isSoftwareGl: boolean;
 
   private mats: SimMaterialLibrary;
@@ -71,7 +95,31 @@ export class JetSimulatorEngine {
   public audio: AviationAudio;
 
   private state: AircraftPhysicsState;
+  private smoothedControls: ControlInputs = createSmoothedControlState();
   private enemies: EnemyAircraft[] = [];
+
+  // Escort & Recon mission 3D assets
+  private escortRig: ReturnType<typeof createAlliedTransportModel> | null = null;
+  private escortPos = new THREE.Vector3(0, 960, -1400);
+  private escortVel = new THREE.Vector3(0, 0, -135);
+  private escortQuat = new THREE.Quaternion();
+  private escortHull = 100;
+  private escortWpIndex = 0;
+
+  private reconGateGroup = new THREE.Group();
+  private reconGateMeshes: THREE.Mesh[] = [];
+  private reconGateGeo: THREE.TorusGeometry;
+  private reconGateMat: THREE.MeshBasicMaterial;
+
+  // Settings, Bindings, Mission & Adaptive Difficulty
+  private graphicsSettings: GraphicsSettings = { ...DEFAULT_GRAPHICS_SETTINGS };
+  private controlBindings: ControlBindings = { ...DEFAULT_CONTROL_BINDINGS };
+  private activeMission: MissionSpec = structuredClone(PRESET_MISSIONS.destroy);
+  private timeOfDay: TimeOfDay = 'day';
+  private difficultyProfile: AdaptiveDifficultyProfile = { ...DEFAULT_DIFFICULTY_PROFILE };
+  private webGpuSupported = false;
+  private webGpuAdapterVerified = false;
+  private inputCaptureSuppressed = false;
 
   // Game & mission state
   private phase: GamePhase = 'title';
@@ -97,6 +145,8 @@ export class JetSimulatorEngine {
   private flightTimeSec = 0;
   private shotsFired = 0;
   private shotsHit = 0;
+  private glocCount = 0;
+  private prevGlocActive = false;
 
   private lockedEnemyId: string | null = null;
   private lockProgress = 0;
@@ -111,6 +161,12 @@ export class JetSimulatorEngine {
   private contrailAccum = 0;
   private damageSmokeAccum = 0;
   private damageDebrisAccum = 0;
+  private endlessMode = false;
+
+  // Event throttling for radio chatter
+  private lastMissileWarnEventTime = -10;
+  private lastEscortWarnEventTime = -10;
+  private hullLowEventSent = false;
 
   // Dynamic weather & landing sequence state
   private cloudImmersion = 0;
@@ -120,10 +176,15 @@ export class JetSimulatorEngine {
   private runwayTouchdownScored = false;
   private lastWeatherRegime = 'BREEZY';
 
+  // FPS estimation
+  private fpsSamples = 0;
+  private fpsAccumDt = 0;
+  private currentFps = 60;
+
   // Input state
   private heldKeys = new Set<string>();
-  private mouseNormX = 0; // -1..1
-  private mouseNormY = 0; // -1..1
+  private mouseNormX = 0;
+  private mouseNormY = 0;
   private mouseLeftDown = false;
 
   // Timing & lifecycle
@@ -132,6 +193,7 @@ export class JetSimulatorEngine {
   private frameId = 0;
   private disposed = false;
   private onTelemetry: (t: HudTelemetry) => void;
+  private onSimEvent?: (ev: SimEventPayload) => void;
   private contextLost = false;
 
   // Bound listeners
@@ -147,11 +209,18 @@ export class JetSimulatorEngine {
   private handleContextLostBound: (e: Event) => void;
   private handleContextRestoredBound: () => void;
 
-  constructor(container: HTMLElement, onTelemetry: (t: HudTelemetry) => void) {
+  constructor(
+    container: HTMLElement,
+    onTelemetry: (t: HudTelemetry) => void,
+    onSimEvent?: (ev: SimEventPayload) => void
+  ) {
     this.container = container;
     this.onTelemetry = onTelemetry;
+    this.onSimEvent = onSimEvent;
 
-    // 1. Software WebGL Detection (renderer string only)
+    this.webGpuSupported = typeof navigator !== 'undefined' && 'gpu' in navigator;
+
+    // 1. Software WebGL Detection
     this.isSoftwareGl = (() => {
       const gl = document.createElement('canvas').getContext('webgl2');
       if (!gl) return true;
@@ -162,7 +231,7 @@ export class JetSimulatorEngine {
       return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
     })();
 
-    // 2. Renderer Configuration (4K-capable high-DPI up to 2x on GPU)
+    // 2. Renderer Configuration (scalable pixel ratio for 4K or 60fps laptop tuning)
     this.renderer = new THREE.WebGLRenderer({
       antialias: !this.isSoftwareGl,
       powerPreference: 'high-performance',
@@ -170,7 +239,7 @@ export class JetSimulatorEngine {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.08;
-    this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    this.applyRendererScale();
     this.renderer.setSize(container.clientWidth || window.innerWidth, container.clientHeight || window.innerHeight);
     this.renderer.shadowMap.enabled = !this.isSoftwareGl;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -211,15 +280,24 @@ export class JetSimulatorEngine {
 
     const hemi = new THREE.HemisphereLight(0x9bd0ff, 0x3b4856, 0.85);
     this.scene.add(hemi);
+    this.hemiLight = hemi;
 
     const rim = new THREE.DirectionalLight(0x93c5fd, 0.55);
     rim.position.set(-1400, 600, 1600);
     this.scene.add(rim);
 
-    // 5. Materials, World, Player Jet, Weapons, Audio
+    // 5. Materials, World, Player Jet, Recon Ring Pool, Weapons, Audio
     this.mats = createMaterialLibrary(this.renderer, this.isSoftwareGl);
     this.world = createWorldEnvironment(this.mats, this.isSoftwareGl);
     this.scene.add(this.world.group);
+
+    this.reconGateGeo = new THREE.TorusGeometry(95, 4.5, 10, 32);
+    this.reconGateMat = new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      transparent: true,
+      opacity: 0.72,
+    });
+    this.scene.add(this.reconGateGroup);
 
     this.playerRig = createPlayerFighterModel(this.mats, this.selectedAircraftId);
     this.scene.add(this.playerRig.root);
@@ -235,6 +313,11 @@ export class JetSimulatorEngine {
     if (!this.isSoftwareGl) {
       this.renderer.compile(this.scene, this.camera);
       this.postfx = createPostProcessingPipeline(this.renderer, this.scene, this.camera);
+      this.postfx.setOptions({
+        bloomEnabled: this.graphicsSettings.bloomEnabled,
+        motionBlurEnabled: this.graphicsSettings.motionBlurEnabled,
+        aaEnabled: this.graphicsSettings.aaEnabled,
+      });
     }
 
     // Bind events
@@ -271,6 +354,72 @@ export class JetSimulatorEngine {
     this.tick();
   }
 
+  private applyRendererScale(): number {
+    const baseDpr = this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2);
+    const scale = this.isSoftwareGl
+      ? Math.min(1, this.graphicsSettings.renderScale)
+      : this.graphicsSettings.renderScale;
+    const effective = THREE.MathUtils.clamp(baseDpr * scale, 0.5, 2.25);
+    this.renderer.setPixelRatio(effective);
+    return effective;
+  }
+
+  public setGraphicsSettings(next: GraphicsSettings): void {
+    this.graphicsSettings = { ...next };
+    this.applyRendererScale();
+    const w = this.container.clientWidth || window.innerWidth;
+    const h = this.container.clientHeight || window.innerHeight;
+    this.postfx?.resize(w, h);
+    this.postfx?.setOptions({
+      bloomEnabled: next.bloomEnabled,
+      motionBlurEnabled: next.motionBlurEnabled,
+      aaEnabled: next.aaEnabled,
+    });
+
+    if (next.experimentalWebGpu && this.webGpuSupported && !this.webGpuAdapterVerified) {
+      const gpuApi = (navigator as unknown as { gpu?: { requestAdapter?: () => Promise<unknown> } }).gpu;
+      gpuApi?.requestAdapter?.().then((adapter) => {
+        if (!this.disposed && adapter) {
+          this.webGpuAdapterVerified = true;
+          this.emitTelemetry();
+        }
+      }).catch(() => {
+        // Silently stay on WebGL2 fallback if WebGPU adapter fails
+      });
+    }
+    this.emitTelemetry();
+  }
+
+  public setControlBindings(next: ControlBindings): void {
+    this.controlBindings = { ...next };
+  }
+
+  public setInputCaptureSuppressed(suppressed: boolean): void {
+    this.inputCaptureSuppressed = suppressed;
+    if (suppressed) {
+      this.heldKeys.clear();
+      this.mouseLeftDown = false;
+    }
+  }
+
+  public setMission(mission: MissionSpec): void {
+    this.activeMission = structuredClone(mission);
+    this.timeOfDay = mission.timeOfDay;
+    this.weather.reset(mission.weatherRegime);
+    this.emitTelemetry();
+  }
+
+  public setTimeOfDay(tod: TimeOfDay): void {
+    this.timeOfDay = tod;
+    this.activeMission.timeOfDay = tod;
+    this.emitTelemetry();
+  }
+
+  public setDifficultyProfile(profile: AdaptiveDifficultyProfile): void {
+    this.difficultyProfile = { ...profile };
+    this.emitTelemetry();
+  }
+
   private syncTitleFlybyState(): void {
     this.state = createInitialAircraftState();
     this.state.position.set(-450, 920, 1200);
@@ -303,12 +452,34 @@ export class JetSimulatorEngine {
     this.emitTelemetry();
   }
 
-  public startSortie(): void {
+  private clearMissionProps(): void {
+    if (this.escortRig) {
+      this.scene.remove(this.escortRig.root);
+      this.escortRig.dispose();
+      this.escortRig = null;
+    }
+    for (const m of this.reconGateMeshes) {
+      this.reconGateGroup.remove(m);
+    }
+    this.reconGateMeshes = [];
+  }
+
+  public startSortie(continueEndless = false): void {
     this.audio.init();
     this.clearEnemies();
+    this.clearMissionProps();
     this.weapons.clearAll();
 
+    this.endlessMode = continueEndless;
+    if (!continueEndless) {
+      // Reset mission waypoints cleanly
+      this.activeMission.waypoints.forEach((wp) => {
+        wp.completed = false;
+      });
+    }
+
     this.state = createInitialAircraftState();
+    this.smoothedControls = createSmoothedControlState();
     this.hull = 100;
     this.maxGunAmmo = this.aircraftSpec.gunAmmo;
     this.gunAmmo = this.aircraftSpec.gunAmmo;
@@ -318,31 +489,74 @@ export class JetSimulatorEngine {
     this.flareCooldown = 0;
     this.gunCooldown = 0;
     this.missileFireCooldown = 0;
-    this.score = 0;
-    this.kills = 0;
-    this.wave = 1;
-    this.flightTimeSec = 0;
-    this.shotsFired = 0;
-    this.shotsHit = 0;
+    this.score = continueEndless ? this.score : 0;
+    this.kills = continueEndless ? this.kills : 0;
+    this.wave = continueEndless ? this.wave + 1 : 1;
+    this.flightTimeSec = continueEndless ? this.flightTimeSec : 0;
+    this.shotsFired = continueEndless ? this.shotsFired : 0;
+    this.shotsHit = continueEndless ? this.shotsHit : 0;
+    this.glocCount = 0;
+    this.prevGlocActive = false;
+    this.hullLowEventSent = false;
+
     this.lockedEnemyId = null;
     this.lockProgress = 0;
     this.killBanner = null;
-    this.resupplyNotice = null;
+    this.resupplyNotice = `${this.activeMission.title} · ${this.activeMission.objectiveType.toUpperCase()}`;
+    this.resupplyTimer = 3.6;
     this.damageSmokeAccum = 0;
     this.damageDebrisAccum = 0;
     this.gearDown = false;
     this.manualGearOverride = null;
     this.onRunwayGround = false;
     this.runwayTouchdownScored = false;
-    this.weather.reset();
+
+    this.timeOfDay = this.activeMission.timeOfDay;
+    this.weather.reset(this.activeMission.weatherRegime);
     this.lastWeatherRegime = this.weather.getSnapshot().regime;
     this.mouseNormX = 0;
     this.mouseNormY = 0;
 
-    this.enemies = spawnEnemyWave(1, this.state.position, this.mats, this.scene);
+    // Mission-specific world entities
+    if (!continueEndless && this.activeMission.objectiveType === 'escort') {
+      this.escortRig = createAlliedTransportModel(this.mats);
+      this.escortPos.set(0, 960, 400);
+      this.escortVel.set(0, 0, -135);
+      this.escortHull = 100;
+      this.escortWpIndex = 0;
+      this.escortRig.root.position.copy(this.escortPos);
+      this.scene.add(this.escortRig.root);
+    } else if (!continueEndless && this.activeMission.objectiveType === 'recon') {
+      for (const wp of this.activeMission.waypoints) {
+        const ring = new THREE.Mesh(this.reconGateGeo, this.reconGateMat);
+        ring.position.set(wp.x, wp.y, wp.z);
+        this.reconGateGroup.add(ring);
+        this.reconGateMeshes.push(ring);
+      }
+    }
+
+    const baseEnemyCount = Math.max(
+      2,
+      this.activeMission.enemyCount + this.difficultyProfile.waveSizeDelta
+    );
+    this.enemies = spawnEnemyWave(
+      this.wave,
+      this.state.position,
+      this.mats,
+      this.scene,
+      baseEnemyCount,
+      this.activeMission.difficultyMultiplier,
+      this.activeMission.objectiveType === 'recon'
+    );
+
     this.phase = 'playing';
     this.cameraMode = 'chase';
     this.emitTelemetry();
+
+    this.onSimEvent?.({
+      type: 'mission_start',
+      detail: `${this.activeMission.title} (${this.activeMission.objectiveType}), sector ${this.activeMission.sectorLabel}, ${this.enemies.length} bandits tracked.`,
+    });
   }
 
   public setPhase(next: GamePhase): void {
@@ -391,7 +605,7 @@ export class JetSimulatorEngine {
 
   public toggleGear(): void {
     if (this.phase !== 'playing') return;
-    if (this.onRunwayGround) return; // keep gear locked down while rolling on runway
+    if (this.onRunwayGround) return;
     this.gearDown = !this.gearDown;
     this.manualGearOverride = this.gearDown;
     this.resupplyNotice = this.gearDown ? 'LANDING GEAR DOWN · ILS ARMED' : 'LANDING GEAR UP';
@@ -440,7 +654,8 @@ export class JetSimulatorEngine {
       this.state.tasMps,
       true,
       activeKind,
-      targetId
+      targetId,
+      false
     );
     this.audio.playMissileLaunch();
     this.cameraShake = Math.max(this.cameraShake, 0.25);
@@ -472,7 +687,7 @@ export class JetSimulatorEngine {
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
-    this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    this.applyRendererScale();
     this.postfx?.resize(w, h);
   }
 
@@ -482,6 +697,10 @@ export class JetSimulatorEngine {
   }
 
   private onKeyDown(e: KeyboardEvent): void {
+    if (this.inputCaptureSuppressed) return;
+    const activeTag = (document.activeElement as HTMLElement | null)?.tagName;
+    if (activeTag === 'INPUT' || activeTag === 'TEXTAREA') return;
+
     const code = e.code;
     if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Tab'].includes(code)) {
       e.preventDefault();
@@ -506,17 +725,18 @@ export class JetSimulatorEngine {
 
     if (!firstPress) return;
 
-    if (code === 'KeyE' || code === 'KeyR' || code === 'Enter') {
+    const b = this.controlBindings;
+    if (code === b.fireMissile || code === 'KeyR' || code === 'Enter') {
       this.fireMissile();
-    } else if (code === 'KeyF' || code === 'KeyX') {
+    } else if (code === b.flare || code === 'KeyX') {
       this.triggerFlare();
-    } else if (code === 'Tab' || code === 'KeyT') {
+    } else if (code === b.cycleTarget || code === 'KeyT') {
       this.cycleTarget();
-    } else if (code === 'KeyC') {
+    } else if (code === b.cycleCamera) {
       this.cycleCamera();
     } else if (code === 'KeyM') {
       this.toggleMute();
-    } else if (code === 'KeyG') {
+    } else if (code === b.gear) {
       this.toggleGear();
     } else if (code === 'Digit1') {
       this.setWeapon('missile_ir');
@@ -539,7 +759,7 @@ export class JetSimulatorEngine {
   }
 
   private onMouseDown(e: MouseEvent): void {
-    if (this.phase !== 'playing') return;
+    if (this.phase !== 'playing' || this.inputCaptureSuppressed) return;
     this.audio.init();
     if (e.button === 0) {
       this.mouseLeftDown = true;
@@ -563,53 +783,46 @@ export class JetSimulatorEngine {
     let pitch = 0;
     let roll = 0;
     let yaw = 0;
+    const b = this.controlBindings;
 
-    // Keyboard flight stick inputs
-    if (this.heldKeys.has('KeyW') || this.heldKeys.has('ArrowUp')) pitch -= 1;
-    if (this.heldKeys.has('KeyS') || this.heldKeys.has('ArrowDown')) pitch += 1;
-    if (this.heldKeys.has('KeyA') || this.heldKeys.has('ArrowLeft')) roll -= 1;
-    if (this.heldKeys.has('KeyD') || this.heldKeys.has('ArrowRight')) roll += 1;
-    if (this.heldKeys.has('KeyQ')) yaw += 1;
-    if (this.heldKeys.has('KeyE') && this.controlMode === 'keyboard') {
-      // E fires missile; use Z/Q or Q/V for rudder if needed
-    }
-    if (this.heldKeys.has('KeyZ')) yaw -= 1;
+    if (this.heldKeys.has(b.pitchDown) || this.heldKeys.has('ArrowUp')) pitch -= 1;
+    if (this.heldKeys.has(b.pitchUp) || this.heldKeys.has('ArrowDown')) pitch += 1;
+    if (this.heldKeys.has(b.rollLeft) || this.heldKeys.has('ArrowLeft')) roll -= 1;
+    if (this.heldKeys.has(b.rollRight) || this.heldKeys.has('ArrowRight')) roll += 1;
+    if (this.heldKeys.has(b.yawLeft)) yaw += 1;
+    if (this.heldKeys.has(b.yawRight)) yaw -= 1;
 
-    // Mouse-Aim Flight Director (when keyboard pitch/roll isn't actively held)
     if (this.controlMode === 'mouse') {
       const dead = 0.03;
       const mx = Math.abs(this.mouseNormX) < dead ? 0 : this.mouseNormX;
       const my = Math.abs(this.mouseNormY) < dead ? 0 : this.mouseNormY;
 
       if (Math.abs(pitch) < 0.01 && Math.abs(roll) < 0.01 && (mx !== 0 || my !== 0)) {
-        // Project desired world aim vector from camera through mouse reticle
         _v1.set(mx * 0.65, my * 0.65, 0.5).unproject(this.camera).sub(this.camera.position).normalize();
-        _fwd.set(0, 0, -1).applyQuaternion(this.state.quaternion).normalize();
         _up.set(0, 1, 0).applyQuaternion(this.state.quaternion).normalize();
         _right.set(1, 0, 0).applyQuaternion(this.state.quaternion).normalize();
 
         const localX = _v1.dot(_right);
         const localY = _v1.dot(_up);
 
-        // Bank into the turn, pull pitch toward target elevation
         const targetBankRoll = THREE.MathUtils.clamp(localX * 3.4, -1, 1);
         const levelRollAssist = _right.y * 0.45;
         roll = THREE.MathUtils.clamp(targetBankRoll + (Math.abs(localX) < 0.08 ? levelRollAssist : 0), -1, 1);
         pitch = THREE.MathUtils.clamp(localY * 3.8 + Math.abs(localX) * 0.35, -1, 1);
         yaw = THREE.MathUtils.clamp(-localX * 0.45, -0.5, 0.5);
       } else if (Math.abs(roll) < 0.01) {
-        // Gentle wings-level tendency when centered
         _right.set(1, 0, 0).applyQuaternion(this.state.quaternion);
         roll = THREE.MathUtils.clamp(_right.y * 0.35, -0.35, 0.35);
       }
     }
 
     let throttleDelta = 0;
-    if (this.heldKeys.has('Equal') || this.heldKeys.has('BracketRight')) throttleDelta += 1;
-    if (this.heldKeys.has('Minus') || this.heldKeys.has('BracketLeft')) throttleDelta -= 1;
+    if (this.heldKeys.has(b.throttleUp) || this.heldKeys.has('BracketRight')) throttleDelta += 1;
+    if (this.heldKeys.has(b.throttleDown) || this.heldKeys.has('BracketLeft')) throttleDelta -= 1;
 
-    const afterburnerBoost = this.heldKeys.has('ShiftLeft') || this.heldKeys.has('ShiftRight');
-    const airbrake = this.heldKeys.has('KeyB');
+    const afterburnerBoost =
+      this.heldKeys.has(b.afterburner) || this.heldKeys.has('ShiftLeft') || this.heldKeys.has('ShiftRight');
+    const airbrake = this.heldKeys.has(b.airbrake);
 
     return {
       pitch: THREE.MathUtils.clamp(pitch, -1, 1),
@@ -627,6 +840,17 @@ export class JetSimulatorEngine {
     const rawDt = this.clock.getDelta();
     const dt = Math.min(rawDt, 0.05);
     this.elapsed += dt;
+
+    // FPS tracker (every ~0.5s window)
+    if (rawDt > 0.0005 && rawDt < 0.5) {
+      this.fpsSamples++;
+      this.fpsAccumDt += rawDt;
+      if (this.fpsAccumDt >= 0.45) {
+        this.currentFps = Math.min(240, Math.round(this.fpsSamples / this.fpsAccumDt));
+        this.fpsSamples = 0;
+        this.fpsAccumDt = 0;
+      }
+    }
 
     if (!this.contextLost) {
       if (this.phase === 'title' || this.phase === 'playing') {
@@ -655,35 +879,48 @@ export class JetSimulatorEngine {
         wSnap.windVecZ,
         wSnap.windSpeedKts,
         wSnap.stormFactor,
-        wSnap.rainIntensity
+        wSnap.rainIntensity,
+        this.timeOfDay
       );
+
+      // Dynamic Time-of-Day Sunlight & Fog Synchronization
+      const todPreset = getTimeOfDayPreset(this.timeOfDay);
+      this.world.getHorizonFogColor(_clearFogColor);
+      this.world.getSunDirection(_sunDir);
+
       const altDensity = cloudDensityAtAltitude(this.state.position.y);
       if (this.scene.fog instanceof THREE.FogExp2) {
         const highAltClear = THREE.MathUtils.clamp((this.state.position.y - 2800) / 3500, 0, 1);
         const targetDensity =
-          (0.000048 + wSnap.stormFactor * 0.000038) * (1 - highAltClear * 0.45) +
+          (0.000046 + wSnap.stormFactor * 0.000038) * (1 - highAltClear * 0.45) +
           altDensity * 0.000018 +
           this.cloudImmersion * 0.00042;
         this.scene.fog.density = THREE.MathUtils.damp(this.scene.fog.density, targetDensity, 4.5, dt);
 
-        _clearFogColor
-          .setHex(0xc4dbed)
-          .lerp(_stormFogColor, wSnap.stormFactor)
-          .lerp(_stratFogColor, highAltClear);
+        if (this.timeOfDay === 'day') {
+          _clearFogColor.lerp(_stratFogColor, highAltClear);
+        }
         this.scene.fog.color.lerpColors(_clearFogColor, _cloudFogColor, Math.min(1, this.cloudImmersion * 1.15));
       }
 
+      this.sunLight.color.lerp(todPreset.sunColor, Math.min(1, dt * 1.4));
       this.sunLight.intensity = THREE.MathUtils.damp(
         this.sunLight.intensity,
-        THREE.MathUtils.lerp(2.3, 1.25, wSnap.stormFactor),
+        todPreset.sunIntensity * THREE.MathUtils.lerp(1.0, 0.55, wSnap.stormFactor),
+        2.0,
+        dt
+      );
+      this.hemiLight.intensity = THREE.MathUtils.damp(
+        this.hemiLight.intensity,
+        todPreset.hemiIntensity,
         2.0,
         dt
       );
 
       this.sunLight.position.set(
-        this.state.position.x + 1600,
-        this.state.position.y + 1200,
-        this.state.position.z - 2200
+        this.state.position.x + _sunDir.x * 3200,
+        this.state.position.y + Math.max(400, _sunDir.y * 3200),
+        this.state.position.z + _sunDir.z * 3200
       );
       this.sunLight.target.position.copy(this.state.position);
       this.sunLight.target.updateMatrixWorld();
@@ -693,11 +930,8 @@ export class JetSimulatorEngine {
         let centerY = 0.5;
         if (this.phase === 'playing' && this.cameraMode !== 'cinematic') {
           _v1.copy(this.state.velocity);
-          if (_v1.lengthSq() > 1) {
-            _v1.normalize();
-          } else {
-            _v1.set(0, 0, -1).applyQuaternion(this.state.quaternion).normalize();
-          }
+          if (_v1.lengthSq() > 1) _v1.normalize();
+          else _v1.set(0, 0, -1).applyQuaternion(this.state.quaternion).normalize();
           _proj.copy(this.camera.position).addScaledVector(_v1, 500).project(this.camera);
           centerX = (_proj.x + 1) * 0.5;
           centerY = (_proj.y + 1) * 0.5;
@@ -712,7 +946,7 @@ export class JetSimulatorEngine {
           cameraShake: this.cameraShake,
           isCockpit: this.cameraMode === 'cockpit',
           isTitle: this.phase === 'title',
-          isPaused: this.phase === 'paused' || this.phase === 'gameover',
+          isPaused: this.phase === 'paused' || this.phase === 'gameover' || this.phase === 'victory',
           centerX,
           centerY,
         });
@@ -747,7 +981,6 @@ export class JetSimulatorEngine {
   }
 
   private updateTitleFlyby(dt: number): void {
-    // Smooth cinematic figure-eight patrol over the coastal fjord & runway
     const t = this.elapsed * 0.14;
     const px = Math.sin(t) * 1800;
     const pz = Math.cos(t * 0.7) * 2200 - 400;
@@ -763,7 +996,6 @@ export class JetSimulatorEngine {
     _camLookAt.copy(this.state.position).add(_v1);
     this.playerRig.root.position.copy(this.state.position);
     this.playerRig.root.lookAt(_camLookAt);
-    // Bank into turn
     this.playerRig.root.rotateZ(Math.cos(t) * 0.36);
 
     this.playerRig.updateVisuals({
@@ -797,7 +1029,6 @@ export class JetSimulatorEngine {
       dt,
     });
 
-    // Orbiting hero showcase camera
     const camAngle = this.elapsed * 0.22;
     _v2.set(Math.sin(camAngle) * 24, 5.5 + Math.sin(this.elapsed * 0.4) * 2.5, Math.cos(camAngle) * 24);
     _camTargetPos.copy(this.state.position).add(_v2);
@@ -806,6 +1037,88 @@ export class JetSimulatorEngine {
     this.camera.up.set(0, 1, 0);
 
     this.audio.updateContinuous(false, 0, false, 0, 0, 0, false, false, false, false, false);
+  }
+
+  private updateMissionObjectives(dt: number): boolean {
+    if (this.endlessMode) return false;
+
+    if (this.activeMission.objectiveType === 'escort' && this.escortRig) {
+      const wps = this.activeMission.waypoints;
+      const wp = wps[Math.min(this.escortWpIndex, wps.length - 1)];
+      if (wp) {
+        _v1.set(wp.x - this.escortPos.x, wp.y - this.escortPos.y, wp.z - this.escortPos.z);
+        const dist = _v1.length();
+        if (dist < 260) {
+          wp.completed = true;
+          if (this.escortWpIndex < wps.length - 1) {
+            this.escortWpIndex++;
+            this.resupplyNotice = `ESCORT REACHED ${wp.label}`;
+            this.resupplyTimer = 3.0;
+          } else {
+            // Escort safely extracted
+            this.score += 1200;
+            this.phase = 'victory';
+            this.onSimEvent?.({
+              type: 'mission_victory',
+              detail: `${this.activeMission.targetName} safely cleared the corridor.`,
+            });
+            return true;
+          }
+        } else {
+          _v1.divideScalar(Math.max(1, dist));
+          this.escortVel.copy(_v1).multiplyScalar(118);
+          this.escortPos.addScaledVector(this.escortVel, dt);
+          _lookMat.lookAt(_origin, _v1, _worldUp);
+          this.escortQuat.setFromRotationMatrix(_lookMat);
+          this.escortRig.root.position.copy(this.escortPos);
+          this.escortRig.root.quaternion.copy(this.escortQuat);
+        }
+      }
+    } else if (this.activeMission.objectiveType === 'recon') {
+      let allDone = true;
+      for (let i = 0; i < this.activeMission.waypoints.length; i++) {
+        const wp = this.activeMission.waypoints[i];
+        const gate = this.reconGateMeshes[i];
+        if (gate) {
+          gate.visible = !wp.completed;
+          if (!wp.completed) {
+            gate.rotation.z = this.elapsed * 0.6 + i;
+            gate.lookAt(this.camera.position);
+          }
+        }
+        if (!wp.completed) {
+          const dist = Math.hypot(
+            this.state.position.x - wp.x,
+            this.state.position.y - wp.y,
+            this.state.position.z - wp.z
+          );
+          if (dist <= wp.radius) {
+            wp.completed = true;
+            this.score += 450;
+            this.audio.playTouchdown(0.95);
+            this.resupplyNotice = `RECON DATA CAPTURED · ${wp.label}`;
+            this.resupplyTimer = 3.0;
+            this.onSimEvent?.({
+              type: 'recon_waypoint',
+              detail: `Recon telemetry secured at ${wp.label}.`,
+            });
+          } else {
+            allDone = false;
+          }
+        }
+      }
+      if (allDone && this.activeMission.waypoints.length > 0) {
+        this.score += 1000;
+        this.phase = 'victory';
+        this.onSimEvent?.({
+          type: 'mission_victory',
+          detail: `All reconnaissance gates imaged in ${this.activeMission.sectorLabel}.`,
+        });
+        return true;
+      }
+    }
+
+    return false;
   }
 
   private updatePlaying(dt: number): void {
@@ -833,9 +1146,12 @@ export class JetSimulatorEngine {
         this.resupplyNotice = `WEATHER SHIFT · ${wSnap.label} · WIND ${String(wSnap.windFromDeg).padStart(3, '0')}°/${wSnap.windSpeedKts}KT`;
         this.resupplyTimer = 4.0;
       }
+      this.onSimEvent?.({
+        type: 'weather_shift',
+        detail: `${wSnap.label} with wind ${wSnap.windFromDeg} deg at ${wSnap.windSpeedKts} knots`,
+      });
     }
 
-    // Auto-extend / retract landing gear smoothly around final approach unless manually overridden
     const preDistToRunway = Math.hypot(
       this.state.position.x - RUNWAY_CENTER.x,
       this.state.position.z - RUNWAY_CENTER.z
@@ -851,13 +1167,15 @@ export class JetSimulatorEngine {
       }
     }
 
-    // Sample local wind shear, gusts, and atmospheric turbulence
     this.weather.sampleWindAt(this.state.position, this.elapsed, this.cloudImmersion, _windVec, _turbSample);
 
-    const input = this.buildControlInputs();
+    // Control input smoothing / fly-by-wire stick shaping + quaternion 6-DOF physics
+    const rawInput = this.buildControlInputs();
+    smoothControlInputs(this.smoothedControls, rawInput, this.state.mach, dt);
+
     stepAircraftPhysics(
       this.state,
-      input,
+      this.smoothedControls,
       dt,
       this.aircraftSpec,
       this.hull,
@@ -867,12 +1185,16 @@ export class JetSimulatorEngine {
       this.onRunwayGround
     );
 
+    if (this.state.gLocActive && !this.prevGlocActive) {
+      this.glocCount++;
+    }
+    this.prevGlocActive = this.state.gLocActive;
+
     if (this.state.crossedMachUp) {
       this.audio.playSonicBoom();
       this.cameraShake = Math.max(this.cameraShake, 0.35);
     }
 
-    // Clamp operational perimeter smoothly (turn back warning / soft boundary)
     if (Math.hypot(this.state.position.x, this.state.position.z) > 13500) {
       this.state.position.x = THREE.MathUtils.clamp(this.state.position.x, -13500, 13500);
       this.state.position.z = THREE.MathUtils.clamp(this.state.position.z, -13500, 13500);
@@ -893,7 +1215,6 @@ export class JetSimulatorEngine {
 
     if (this.onRunwayGround) {
       if (!overRunway) {
-        // Rolled off runway shoulder: bump back slightly or transition airborne if rotating
         if (this.state.velocity.y > 1.8 && this.state.tasMps > 55) {
           this.onRunwayGround = false;
           this.runwayTouchdownScored = false;
@@ -907,8 +1228,7 @@ export class JetSimulatorEngine {
           return;
         }
       } else {
-        // Check for takeoff rotation lift-off
-        if (this.state.velocity.y > 2.4 && this.state.tasMps > 64 && input.pitch > 0.1) {
+        if (this.state.velocity.y > 2.4 && this.state.tasMps > 64 && this.smoothedControls.pitch > 0.1) {
           this.onRunwayGround = false;
           this.runwayTouchdownScored = false;
           this.manualGearOverride = null;
@@ -933,7 +1253,6 @@ export class JetSimulatorEngine {
         pitchDegNow <= 22 &&
         this.state.iasKts <= 250
       ) {
-        // Successful precision runway touchdown
         this.onRunwayGround = true;
         this.state.position.y = RUNWAY_CENTER.y + 2.35;
         this.state.velocity.y = 0;
@@ -948,6 +1267,7 @@ export class JetSimulatorEngine {
           const landPts = Math.round(320 + smoothness * 260 + xwindKtsAbs * 14);
           this.score += landPts;
           this.hull = 100;
+          this.hullLowEventSent = false;
           this.gunAmmo = this.maxGunAmmo;
           this.missilesIr = this.aircraftSpec.missilesIr;
           this.missilesRadar = this.aircraftSpec.missilesRadar;
@@ -958,7 +1278,6 @@ export class JetSimulatorEngine {
           this.resupplyTimer = 4.4;
         }
       } else if (!this.gearDown || sinkMps > 16.5 || rollDegAbs > 36) {
-        // Hard gear-up or heavy sink slam onto runway
         const impactDmg = !this.gearDown ? 38 : Math.min(80, sinkMps * 4.4);
         this.hull = Math.max(0, this.hull - impactDmg);
         this.weapons.spawnHitSparks(this.state.position);
@@ -977,13 +1296,11 @@ export class JetSimulatorEngine {
         this.resupplyNotice = !this.gearDown ? 'GEAR UP IMPACT · PRESS [G]' : 'HARD BOUNCE · GO AROUND';
         this.resupplyTimer = 2.8;
       } else {
-        // Mild bounce on fast/firm approach
         this.audio.playTouchdown(0.25);
         this.state.position.y = RUNWAY_CENTER.y + 2.8;
         this.state.velocity.y = Math.max(4, sinkMps * 0.35);
       }
     } else if (radarAlt <= 3.5) {
-      // Fatal terrain / ocean impact
       this.hull = 0;
       this.weapons.spawnExplosion(this.state.position, 1.8);
       this.audio.playExplosion(1.2);
@@ -993,7 +1310,7 @@ export class JetSimulatorEngine {
       return;
     }
 
-    // Friendly Airbase Runway Low-Pass Rearm & Repair
+    // Airbase Runway Low-Pass Rearm & Repair
     const distToRunway = Math.hypot(
       this.state.position.x - RUNWAY_CENTER.x,
       this.state.position.z - RUNWAY_CENTER.z
@@ -1007,6 +1324,7 @@ export class JetSimulatorEngine {
         this.flares < this.aircraftSpec.flares;
       if (needed) {
         this.hull = 100;
+        this.hullLowEventSent = false;
         this.gunAmmo = this.maxGunAmmo;
         this.missilesIr = this.aircraftSpec.missilesIr;
         this.missilesRadar = this.aircraftSpec.missilesRadar;
@@ -1017,8 +1335,10 @@ export class JetSimulatorEngine {
       }
     }
 
-    // M61 Vulcan Rotary Cannon firing (disabled while incapacitated in G-LOC)
-    const wantGun = !this.state.gLocActive && (this.heldKeys.has('Space') || this.mouseLeftDown);
+    // M61 Vulcan Rotary Cannon firing
+    const wantGun =
+      !this.state.gLocActive &&
+      (this.heldKeys.has(this.controlBindings.fireGun) || this.mouseLeftDown);
     let firingGun = false;
     if (wantGun && this.gunAmmo > 0) {
       firingGun = true;
@@ -1060,24 +1380,11 @@ export class JetSimulatorEngine {
             ? -0.52
             : -0.68
           : 0;
-        // Engine smoke plume
         _v1.set(dmgNozX, 0.06, 6.1).applyQuaternion(this.state.quaternion).add(this.state.position);
-        _v2.set(
-          (Math.random() - 0.5) * 14,
-          (Math.random() - 0.5) * 14,
-          (Math.random() - 0.5) * 14
-        );
+        _v2.set((Math.random() - 0.5) * 14, (Math.random() - 0.5) * 14, (Math.random() - 0.5) * 14);
         const smokeCol = Math.random() < 0.35 ? 0x1e293b : 0x475569;
-        this.weapons.spawnParticle(
-          _v1,
-          _v2,
-          1.35 + severity * 0.7,
-          0.95 + severity * 0.65,
-          5.8 + severity * 4.5,
-          smokeCol
-        );
+        this.weapons.spawnParticle(_v1, _v2, 1.35 + severity * 0.7, 0.95 + severity * 0.65, 5.8 + severity * 4.5, smokeCol);
 
-        // Intermittent combustion flare / burning fuel puff from damaged engine
         if (Math.random() < 0.32 + severity * 0.4) {
           this.weapons.spawnParticle(
             _v1,
@@ -1089,32 +1396,22 @@ export class JetSimulatorEngine {
           );
         }
 
-        // Secondary starboard wing-root smoke when hull is critical (< 28%)
         if (this.hull < 28) {
           _v1.set(1.9, 0.08, 2.8).applyQuaternion(this.state.quaternion).add(this.state.position);
           this.weapons.spawnParticle(_v1, _v2, 1.1, 0.7, 4.2, 0x334155);
         }
       }
 
-      // Localized metallic debris & hot sparks peeling off damaged airframe
       const debrisInterval = THREE.MathUtils.lerp(0.18, 0.065, severity);
       this.damageDebrisAccum += dt;
       if (this.damageDebrisAccum >= debrisInterval) {
         this.damageDebrisAccum = 0;
         const sideX = Math.random() > 0.3 ? -0.95 : 1.45;
-        _v1.set(sideX, 0.15, 2.5 + Math.random() * 2.5)
-          .applyQuaternion(this.state.quaternion)
-          .add(this.state.position);
+        _v1.set(sideX, 0.15, 2.5 + Math.random() * 2.5).applyQuaternion(this.state.quaternion).add(this.state.position);
         _v2
           .copy(this.state.velocity)
           .multiplyScalar(0.55)
-          .add(
-            _v3.set(
-              (Math.random() - 0.5) * 42,
-              (Math.random() - 0.5) * 34 - 8,
-              (Math.random() - 0.5) * 42
-            )
-          );
+          .add(_v3.set((Math.random() - 0.5) * 42, (Math.random() - 0.5) * 34 - 8, (Math.random() - 0.5) * 42));
         const isSpark = Math.random() < 0.6;
         this.weapons.spawnParticle(
           _v1,
@@ -1130,12 +1427,20 @@ export class JetSimulatorEngine {
     // Sync player 3D model & cockpit instrumentation
     _euler.setFromQuaternion(this.state.quaternion, 'YXZ');
     const incomingMissileNow = this.weapons.missiles.some((m) => m.active && !m.fromPlayer && !m.spoofedByFlare);
+    if (incomingMissileNow && this.elapsed - this.lastMissileWarnEventTime > 12) {
+      this.lastMissileWarnEventTime = this.elapsed;
+      this.onSimEvent?.({
+        type: 'missile_inbound',
+        detail: `Fox-2 inbound at ${Math.round(this.state.position.y * 3.28084)}ft, Mach ${this.state.mach.toFixed(2)}.`,
+      });
+    }
+
     this.playerRig.root.position.copy(this.state.position);
     this.playerRig.root.quaternion.copy(this.state.quaternion);
     this.playerRig.updateVisuals({
-      pitchInput: this.state.gLocActive ? 0 : input.pitch,
-      rollInput: this.state.gLocActive ? 0 : input.roll,
-      yawInput: this.state.gLocActive ? 0 : input.yaw,
+      pitchInput: this.state.gLocActive ? 0 : this.smoothedControls.pitch,
+      rollInput: this.state.gLocActive ? 0 : this.smoothedControls.roll,
+      yawInput: this.state.gLocActive ? 0 : this.smoothedControls.yaw,
       throttle01: this.state.throttle,
       afterburner: this.state.afterburner,
       airbrake: this.state.airbrake,
@@ -1163,13 +1468,40 @@ export class JetSimulatorEngine {
       dt,
     });
 
-    // Update Enemy AI
+    // Update Escort / Recon objectives
+    const missionWon = this.updateMissionObjectives(dt);
+    if (missionWon) {
+      this.audio.updateContinuous(false, 0, false, 0, 0, 0, false, false, false, false, false);
+      this.emitTelemetry();
+      return;
+    }
+
+    // Update Enemy AI (4-state FSM: patrol -> engage -> evade -> retreat)
     let anyLockingPlayer = false;
+    const activeEscortPos = this.escortRig ? this.escortPos : null;
+    const activeEscortVel = this.escortRig ? this.escortVel : null;
+
     for (const enemy of this.enemies) {
       if (!enemy.alive) continue;
-      const act = updateEnemyAi(enemy, this.state.position, this.state.velocity, this.wave, dt, this.elapsed);
+      const act = updateEnemyAi(
+        enemy,
+        this.state.position,
+        this.state.velocity,
+        this.wave,
+        dt,
+        this.elapsed,
+        this.difficultyProfile,
+        activeEscortPos,
+        activeEscortVel
+      );
       if (enemy.isLockingPlayer) anyLockingPlayer = true;
 
+      if (act.enteredRetreat) {
+        this.onSimEvent?.({
+          type: 'enemy_retreat',
+          detail: `${enemy.callsign} badly damaged (${Math.round(enemy.health)} HP), breaking off engagement.`,
+        });
+      }
       if (act.fireGun) {
         _fwd.set(0, 0, -1).applyQuaternion(enemy.quaternion).normalize();
         _v1.set(0, 0, -8).applyQuaternion(enemy.quaternion).add(enemy.position);
@@ -1177,78 +1509,127 @@ export class JetSimulatorEngine {
       }
       if (act.fireMissile) {
         _v1.set(0, -0.8, -2).applyQuaternion(enemy.quaternion).add(enemy.position);
-        this.weapons.spawnMissile(_v1, enemy.quaternion, enemy.speed, false, 'ir', null);
+        this.weapons.spawnMissile(
+          _v1,
+          enemy.quaternion,
+          enemy.speed,
+          false,
+          'ir',
+          null,
+          act.targetEscort
+        );
       }
     }
 
-    // Update Target Lock Acquisition (automatic best target in boresight or manually cycled)
     this.updateTargetLock(dt);
 
-    // Update Weapons & Collisions
-    this.weapons.update(dt, this.state.position, this.enemies, {
-      onEnemyHit: (enemy, damage, isMissile) => {
-        if (!enemy.alive) return;
-        enemy.health -= damage;
-        enemy.hitFlashTimer = 0.14;
-        this.hitMarkerTimer = 0.18;
-        if (!isMissile) this.shotsHit++;
-        this.audio.playHitImpact();
+    // Update Pooled Weapons & Collisions
+    this.weapons.update(
+      dt,
+      this.state.position,
+      this.enemies,
+      {
+        onEnemyHit: (enemy, damage, isMissile) => {
+          if (!enemy.alive) return;
+          enemy.health -= damage;
+          enemy.hitFlashTimer = 0.14;
+          this.hitMarkerTimer = 0.18;
+          if (!isMissile) this.shotsHit++;
+          this.audio.playHitImpact();
 
-        if (enemy.health <= 0) {
-          enemy.alive = false;
-          this.scene.remove(enemy.model.root);
-          this.weapons.spawnExplosion(enemy.position, 1.85);
-          this.audio.playExplosion(1.1);
-          this.kills++;
-          this.score += isMissile ? 350 : 500; // Bonus for gun kill
-          this.killBanner = `${enemy.callsign} SPLASHED`;
-          this.killBannerTimer = 2.6;
-          this.hitstopTimer = 0.042; // Crisp 42ms impact hitstop
-          this.cameraShake = Math.max(this.cameraShake, 0.55);
+          if (enemy.health <= 0) {
+            enemy.alive = false;
+            this.scene.remove(enemy.model.root);
+            this.weapons.spawnExplosion(enemy.position, 1.85);
+            this.audio.playExplosion(1.1);
+            this.kills++;
+            this.score += isMissile ? 350 : 500;
+            this.killBanner = `${enemy.callsign} SPLASHED`;
+            this.killBannerTimer = 2.6;
+            this.hitstopTimer = 0.042;
+            this.cameraShake = Math.max(this.cameraShake, 0.55);
 
-          if (this.lockedEnemyId === enemy.id) {
-            this.lockedEnemyId = null;
-            this.lockProgress = 0;
+            this.onSimEvent?.({
+              type: 'splash',
+              detail: `${enemy.callsign} destroyed by ${isMissile ? 'missile' : '20mm cannon'}`,
+            });
+
+            if (this.lockedEnemyId === enemy.id) {
+              this.lockedEnemyId = null;
+              this.lockProgress = 0;
+            }
           }
-        }
-      },
-      onPlayerHit: (damage, isMissile) => {
-        const prevHull = this.hull;
-        this.hull = Math.max(0, this.hull - damage);
-        this.cameraShake = Math.max(this.cameraShake, isMissile ? 0.75 : 0.3);
-        this.weapons.spawnHitSparks(this.state.position);
-        // Immediate localized debris chunk burst when hit below 50% or crossing 50% threshold
-        if (this.hull < 50 || (prevHull >= 50 && this.hull < 50)) {
-          for (let i = 0; i < 6; i++) {
-            _v1.set(
-              (Math.random() - 0.5) * 65,
-              (Math.random() - 0.5) * 55,
-              (Math.random() - 0.5) * 65
-            );
-            this.weapons.spawnParticle(
-              this.state.position,
-              _v1,
-              0.85,
-              0.55,
-              0.25,
-              i % 2 === 0 ? 0xf97316 : 0x64748b
-            );
+        },
+        onPlayerHit: (damage, isMissile) => {
+          const prevHull = this.hull;
+          this.hull = Math.max(0, this.hull - damage);
+          this.cameraShake = Math.max(this.cameraShake, isMissile ? 0.75 : 0.3);
+          this.weapons.spawnHitSparks(this.state.position);
+          if (this.hull < 50 || (prevHull >= 50 && this.hull < 50)) {
+            if (!this.hullLowEventSent) {
+              this.hullLowEventSent = true;
+              this.onSimEvent?.({
+                type: 'hull_low',
+                detail: `Player airframe at ${Math.round(this.hull)}% hull, engine fire/smoke trailing.`,
+              });
+            }
+            for (let i = 0; i < 6; i++) {
+              _v1.set((Math.random() - 0.5) * 65, (Math.random() - 0.5) * 55, (Math.random() - 0.5) * 65);
+              this.weapons.spawnParticle(
+                this.state.position,
+                _v1,
+                0.85,
+                0.55,
+                0.25,
+                i % 2 === 0 ? 0xf97316 : 0x64748b
+              );
+            }
           }
-        }
-        if (this.hull <= 0) {
-          this.weapons.spawnExplosion(this.state.position, 1.8);
-          this.audio.playExplosion(1.2);
-          this.phase = 'gameover';
-        }
+          if (this.hull <= 0) {
+            this.weapons.spawnExplosion(this.state.position, 1.8);
+            this.audio.playExplosion(1.2);
+            this.phase = 'gameover';
+          }
+        },
+        onEscortHit: (damage) => {
+          if (!this.escortRig) return;
+          this.escortHull = Math.max(0, this.escortHull - damage);
+          if (this.elapsed - this.lastEscortWarnEventTime > 10) {
+            this.lastEscortWarnEventTime = this.elapsed;
+            this.onSimEvent?.({
+              type: 'escort_under_fire',
+              detail: `GUARDIAN-1 taking enemy fire, integrity at ${Math.round(this.escortHull)}%`,
+            });
+          }
+          if (this.escortHull <= 0) {
+            this.weapons.spawnExplosion(this.escortPos, 2.4);
+            this.audio.playExplosion(1.2);
+            this.resupplyNotice = 'GUARDIAN-1 LOST · MISSION FAILED';
+            this.phase = 'gameover';
+          }
+        },
+        onExplosion: () => {
+          this.audio.playExplosion(0.7);
+        },
       },
-      onExplosion: () => {
-        this.audio.playExplosion(0.7);
-      },
-    });
+      activeEscortPos
+    );
 
-    // Advance Wave if all enemies splashed
+    // Wave Clear Progression / Destroy Victory
     const remaining = this.enemies.filter((e) => e.alive).length;
     if (remaining === 0 && this.phase === 'playing') {
+      if (!this.endlessMode && this.activeMission.objectiveType === 'destroy' && this.wave >= 2) {
+        this.score += 1100;
+        this.phase = 'victory';
+        this.onSimEvent?.({
+          type: 'mission_victory',
+          detail: `Airspace secured over ${this.activeMission.sectorLabel} (${this.kills} hostiles splashed).`,
+        });
+        this.audio.updateContinuous(false, 0, false, 0, 0, 0, false, false, false, false, false);
+        this.emitTelemetry();
+        return;
+      }
+
       this.wave++;
       this.score += 750;
       this.missilesIr = Math.min(this.aircraftSpec.missilesIr, this.missilesIr + 1);
@@ -1258,13 +1639,23 @@ export class JetSimulatorEngine {
       this.killBanner = `WAVE ${this.wave} SCRAMBLED`;
       this.killBannerTimer = 3.0;
       this.clearEnemies();
-      this.enemies = spawnEnemyWave(this.wave, this.state.position, this.mats, this.scene);
+
+      const nextCount = Math.max(
+        2,
+        this.activeMission.enemyCount + (this.wave - 1) + this.difficultyProfile.waveSizeDelta
+      );
+      this.enemies = spawnEnemyWave(
+        this.wave,
+        this.state.position,
+        this.mats,
+        this.scene,
+        nextCount,
+        this.activeMission.difficultyMultiplier
+      );
     }
 
-    // Update Camera
     this.updateCamera(dt);
 
-    // Update Continuous Procedural Audio
     const incomingMissile = this.weapons.missiles.some((m) => m.active && !m.fromPlayer && !m.spoofedByFlare);
     const sinkRate = -this.state.velocity.y;
     const approachFlareSafe = overRunway && this.gearDown && sinkRate < 11.5;
@@ -1302,7 +1693,6 @@ export class JetSimulatorEngine {
     const maxRange = this.selectedWeapon === 'missile_radar' ? 9500 : 4800;
     const maxCone = this.selectedWeapon === 'missile_radar' ? 0.36 : 0.44;
 
-    // Auto-select nearest target inside seeker cone if none selected
     let locked = alive.find((e) => e.id === this.lockedEnemyId);
     if (!locked) {
       let bestScore = Infinity;
@@ -1334,7 +1724,6 @@ export class JetSimulatorEngine {
 
   private updateCamera(dt: number): void {
     if (this.cameraMode === 'cockpit') {
-      // Dynamic pilot eye inside 3D canopy with G-load seat compression, buffet & look-into-turn
       const headDrop = THREE.MathUtils.clamp((this.state.gForce - 1) * 0.0065, -0.02, 0.05);
       const headSway = THREE.MathUtils.clamp(-this.state.angularVelocity.z * 0.022, -0.032, 0.032);
       const buffetAmp =
@@ -1372,7 +1761,6 @@ export class JetSimulatorEngine {
       this.camera.fov = THREE.MathUtils.damp(this.camera.fov, 58, 6, dt);
       this.camera.updateProjectionMatrix();
     } else {
-      // Chase Cam with speed FOV widening + smooth bank-following lag
       _fwd.set(0, 0, -1).applyQuaternion(this.state.quaternion).normalize();
       _up.set(0, 1, 0).applyQuaternion(this.state.quaternion).normalize();
 
@@ -1395,7 +1783,6 @@ export class JetSimulatorEngine {
       this.camera.updateProjectionMatrix();
     }
 
-    // Apply decaying camera shake
     if (this.cameraShake > 0.005) {
       this.camera.position.x += (Math.random() - 0.5) * this.cameraShake * 0.8;
       this.camera.position.y += (Math.random() - 0.5) * this.cameraShake * 0.8;
@@ -1424,13 +1811,11 @@ export class JetSimulatorEngine {
     const w = this.container.clientWidth || window.innerWidth;
     const h = this.container.clientHeight || window.innerHeight;
 
-    // Heading, Pitch, Roll in degrees
     _euler.setFromQuaternion(this.state.quaternion, 'YXZ');
     const headingDeg = (((-THREE.MathUtils.radToDeg(_euler.y)) % 360) + 360) % 360;
     const pitchDeg = THREE.MathUtils.radToDeg(_euler.x);
     const rollDeg = THREE.MathUtils.radToDeg(_euler.z);
 
-    // Boresight & Flight Path Vector (Velocity Vector) projection
     _fwd.set(0, 0, -1).applyQuaternion(this.state.quaternion).normalize();
     _v1.copy(this.state.position).addScaledVector(_fwd, 600);
     const bore = this.projectToScreen(_v1, w, h);
@@ -1441,10 +1826,12 @@ export class JetSimulatorEngine {
     _v1.copy(this.state.position).addScaledVector(_v2, 600);
     const fpv = this.projectToScreen(_v1, w, h);
 
-    // Project targets & gun lead pipper
     const targets: ProjectedTarget[] = [];
+    const projectedWaypoints: ProjectedWaypoint[] = [];
     const radarBlips: RadarBlip[] = [];
     const radarRange = 9000;
+    const cosH = Math.cos(_euler.y);
+    const sinH = Math.sin(_euler.y);
 
     _right.set(1, 0, 0).applyQuaternion(this.state.quaternion).normalize();
 
@@ -1453,7 +1840,6 @@ export class JetSimulatorEngine {
       const dist = e.position.distanceTo(this.state.position);
       const scr = this.projectToScreen(e.position, w, h);
 
-      // Closure rate along line of sight
       _v1.subVectors(e.position, this.state.position).divideScalar(Math.max(1, dist));
       _v2.subVectors(this.state.velocity, e.velocity);
       const closureRateMps = _v2.dot(_v1);
@@ -1491,11 +1877,9 @@ export class JetSimulatorEngine {
         leadValid: leadValid && leadScr.inFront && dist < 2100,
         isLockingPlayer: e.isLockingPlayer,
         relBearingRad,
+        aiMode: e.mode,
       });
 
-      // Radar horizontal projection rotated into player heading
-      const cosH = Math.cos(_euler.y);
-      const sinH = Math.sin(_euler.y);
       const rx = relX * cosH - relZ * sinH;
       const rz = relX * sinH + relZ * cosH;
       radarBlips.push({
@@ -1507,13 +1891,61 @@ export class JetSimulatorEngine {
       });
     }
 
-    // Incoming enemy missiles on radar
+    // Mission Waypoints & Allied Escort HUD + Radar Markers
+    if (this.escortRig && this.activeMission.objectiveType === 'escort') {
+      const scr = this.projectToScreen(this.escortPos, w, h);
+      projectedWaypoints.push({
+        id: 'escort_guardian',
+        label: `GUARDIAN-1 (${Math.round(this.escortHull)}%)`,
+        x: scr.x,
+        y: scr.y,
+        inFront: scr.inFront,
+        distanceMeters: this.escortPos.distanceTo(this.state.position),
+        kind: 'escort',
+        completed: false,
+      });
+      const relX = this.escortPos.x - this.state.position.x;
+      const relZ = this.escortPos.z - this.state.position.z;
+      radarBlips.push({
+        id: 'escort_guardian',
+        dx: THREE.MathUtils.clamp((relX * cosH - relZ * sinH) / radarRange, -0.95, 0.95),
+        dz: THREE.MathUtils.clamp((relX * sinH + relZ * cosH) / radarRange, -0.95, 0.95),
+        isLocked: false,
+        isMissile: false,
+        isAlly: true,
+      });
+    } else if (this.activeMission.objectiveType === 'recon') {
+      for (const wp of this.activeMission.waypoints) {
+        if (wp.completed) continue;
+        _v1.set(wp.x, wp.y, wp.z);
+        const scr = this.projectToScreen(_v1, w, h);
+        projectedWaypoints.push({
+          id: wp.id,
+          label: wp.label,
+          x: scr.x,
+          y: scr.y,
+          inFront: scr.inFront,
+          distanceMeters: _v1.distanceTo(this.state.position),
+          kind: 'recon',
+          completed: wp.completed,
+        });
+        const relX = wp.x - this.state.position.x;
+        const relZ = wp.z - this.state.position.z;
+        radarBlips.push({
+          id: wp.id,
+          dx: THREE.MathUtils.clamp((relX * cosH - relZ * sinH) / radarRange, -0.95, 0.95),
+          dz: THREE.MathUtils.clamp((relX * sinH + relZ * cosH) / radarRange, -0.95, 0.95),
+          isLocked: false,
+          isMissile: false,
+          isObjective: true,
+        });
+      }
+    }
+
     for (const m of this.weapons.missiles) {
       if (!m.active || m.fromPlayer) continue;
       const relX = m.position.x - this.state.position.x;
       const relZ = m.position.z - this.state.position.z;
-      const cosH = Math.cos(_euler.y);
-      const sinH = Math.sin(_euler.y);
       radarBlips.push({
         id: m.id,
         dx: THREE.MathUtils.clamp((relX * cosH - relZ * sinH) / radarRange, -0.95, 0.95),
@@ -1523,12 +1955,9 @@ export class JetSimulatorEngine {
       });
     }
 
-    // Friendly airbase blip on radar
     {
       const relX = RUNWAY_CENTER.x - this.state.position.x;
       const relZ = RUNWAY_CENTER.z - this.state.position.z;
-      const cosH = Math.cos(_euler.y);
-      const sinH = Math.sin(_euler.y);
       radarBlips.push({
         id: 'airbase',
         dx: THREE.MathUtils.clamp((relX * cosH - relZ * sinH) / radarRange, -0.95, 0.95),
@@ -1543,7 +1972,6 @@ export class JetSimulatorEngine {
     const lockStatus: 'NONE' | 'TRACK' | 'LOCK' =
       this.lockProgress >= 0.85 ? 'LOCK' : this.lockProgress > 0.1 ? 'TRACK' : 'NONE';
 
-    // Weather & ILS Runway Approach Geometry
     const wSnap = this.weather.getSnapshot();
     const windRelDeg = (((wSnap.windFromDeg - headingDeg) % 360) + 360) % 360;
     const dxRwy = RUNWAY_CENTER.x - this.state.position.x;
@@ -1551,7 +1979,6 @@ export class JetSimulatorEngine {
     const rwyDistM = Math.hypot(dxRwy, dzRwy);
     const rwyBearingDeg = (((THREE.MathUtils.radToDeg(Math.atan2(dxRwy, -dzRwy))) % 360) + 360) % 360;
 
-    // Select nearest runway approach end (South approach landing North 000°, or North approach landing South 180°)
     const landingNorth = this.state.position.z >= RUNWAY_CENTER.z;
     const thrZ = landingNorth
       ? RUNWAY_CENTER.z + RUNWAY_LENGTH * 0.5 - 160
@@ -1565,7 +1992,6 @@ export class JetSimulatorEngine {
     const idealAltM = RUNWAY_CENTER.y + distAlong * Math.tan(THREE.MathUtils.degToRad(3.0));
     const glideslopeOffset = THREE.MathUtils.clamp((this.state.position.y - idealAltM) / 90, -1, 1);
 
-    // Crosswind (+ = from pilot right pushing left) & Headwind (+ = headwind) relative to runway heading
     const windEastKts = wSnap.windVecX * 1.943844;
     const windSouthKts = wSnap.windVecZ * 1.943844;
     const crosswindKts = Math.round(landingNorth ? -windEastKts : windEastKts);
@@ -1574,6 +2000,27 @@ export class JetSimulatorEngine {
     const runwayApproachActive =
       this.gearDown || this.onRunwayGround || (rwyDistM < 4800 && radarAltM < 800);
     const verticalSpeedFpm = Math.round(this.state.velocity.y * 196.85);
+
+    // Mission objective progress summary
+    let missionObjectiveText = `Wave ${this.wave} · Splash ${targets.length} Bandits`;
+    let missionProgressPct = 0;
+    if (this.endlessMode) {
+      missionObjectiveText = `Endless CAP Wave ${this.wave} · ${targets.length} Hostiles`;
+      missionProgressPct = 50;
+    } else if (this.activeMission.objectiveType === 'escort') {
+      const doneCount = this.activeMission.waypoints.filter((wp) => wp.completed).length;
+      const totalWps = Math.max(1, this.activeMission.waypoints.length);
+      missionObjectiveText = `Escort GUARDIAN-1 (${Math.round(this.escortHull)}%) · WP ${Math.min(doneCount + 1, totalWps)}/${totalWps}`;
+      missionProgressPct = Math.round((doneCount / totalWps) * 100);
+    } else if (this.activeMission.objectiveType === 'recon') {
+      const doneCount = this.activeMission.waypoints.filter((wp) => wp.completed).length;
+      const totalWps = Math.max(1, this.activeMission.waypoints.length);
+      missionObjectiveText = `Recon Gates ${doneCount}/${totalWps} · Evade/Engage CAP`;
+      missionProgressPct = Math.round((doneCount / totalWps) * 100);
+    } else {
+      missionObjectiveText = `Destroy Hostiles (Wave ${this.wave}/2) · ${targets.length} Remaining`;
+      missionProgressPct = Math.min(100, Math.round(((this.wave - 1) * 50) + (targets.length === 0 ? 50 : 15)));
+    }
 
     this.onTelemetry({
       phase: this.phase,
@@ -1620,6 +2067,7 @@ export class JetSimulatorEngine {
       mouseAimX: ((this.mouseNormX + 1) * 0.5) * w,
       mouseAimY: ((-this.mouseNormY + 1) * 0.5) * h,
       targets,
+      projectedWaypoints,
       radarBlips,
       cameraMode: this.cameraMode,
       controlMode: this.controlMode,
@@ -1634,6 +2082,7 @@ export class JetSimulatorEngine {
       flightTimeSec: this.flightTimeSec,
       shotsFired: this.shotsFired,
       shotsHit: this.shotsHit,
+      glocCount: this.glocCount,
       weatherRegime: wSnap.regime,
       weatherLabel: wSnap.label,
       windFromDeg: wSnap.windFromDeg,
@@ -1653,6 +2102,17 @@ export class JetSimulatorEngine {
       crosswindKts,
       headwindKts,
       verticalSpeedFpm,
+      fps: this.currentFps,
+      renderScaleActual: this.graphicsSettings.renderScale,
+      webGpuSupported: this.webGpuSupported,
+      webGpuFlagActive: this.graphicsSettings.experimentalWebGpu && this.webGpuAdapterVerified,
+      timeOfDay: this.timeOfDay,
+      missionTitle: this.activeMission.title,
+      missionType: this.activeMission.objectiveType,
+      missionObjectiveText,
+      missionProgressPct,
+      escortHullPct: this.escortRig ? Math.round(this.escortHull) : null,
+      skillTier: this.difficultyProfile.skillTier,
     });
   }
 
@@ -1674,6 +2134,9 @@ export class JetSimulatorEngine {
     this.renderer.domElement.removeEventListener('webglcontextrestored', this.handleContextRestoredBound);
 
     this.clearEnemies();
+    this.clearMissionProps();
+    this.reconGateGeo.dispose();
+    this.reconGateMat.dispose();
     this.weapons.dispose();
     this.playerRig.dispose();
     this.world.dispose();

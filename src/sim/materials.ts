@@ -20,6 +20,7 @@ export interface SimMaterialLibrary {
   runwayAsphalt: THREE.MeshStandardMaterial;
   concreteApron: THREE.MeshStandardMaterial;
   oceanWater: THREE.MeshPhysicalMaterial;
+  createExhaustShaderMaterial: (variant?: 'jet' | 'missile') => THREE.ShaderMaterial;
   dispose: () => void;
 }
 
@@ -400,6 +401,85 @@ export function createMaterialLibrary(
     oceanWater,
   ];
 
+  const createExhaustShaderMaterial = (variant: 'jet' | 'missile' = 'jet'): THREE.ShaderMaterial => {
+    const isMissile = variant === 'missile';
+    const mat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+      uniforms: {
+        uTime: { value: 0 },
+        uPower: { value: isMissile ? 1.0 : 0.85 },
+        uMach: { value: isMissile ? 1.8 : 0.9 },
+        uCoreColor: { value: new THREE.Color(isMissile ? 0xfffbeb : 0xe0f2fe) },
+        uMidColor: { value: new THREE.Color(isMissile ? 0xfbbf24 : 0x7c8cff) },
+        uOuterColor: { value: new THREE.Color(isMissile ? 0xea580c : 0xf97316) },
+      },
+      vertexShader: /* glsl */ `
+        varying vec2 vUv;
+        varying vec3 vNormalView;
+        varying vec3 vViewDir;
+
+        void main() {
+          vUv = uv;
+          vec4 mvPos;
+          #ifdef USE_INSTANCING
+            mvPos = modelViewMatrix * instanceMatrix * vec4(position, 1.0);
+            vNormalView = normalize(normalMatrix * mat3(instanceMatrix) * normal);
+          #else
+            mvPos = modelViewMatrix * vec4(position, 1.0);
+            vNormalView = normalize(normalMatrix * normal);
+          #endif
+          vViewDir = normalize(-mvPos.xyz);
+          gl_Position = projectionMatrix * mvPos;
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform float uTime;
+        uniform float uPower;
+        uniform float uMach;
+        uniform vec3 uCoreColor;
+        uniform vec3 uMidColor;
+        uniform vec3 uOuterColor;
+
+        varying vec2 vUv;
+        varying vec3 vNormalView;
+        varying vec3 vViewDir;
+
+        void main() {
+          // Axial coordinate: 0 at nozzle exit -> 1 at plume tail (Cone rotated +Z)
+          float axial = clamp(1.0 - vUv.y, 0.0, 1.0);
+
+          // Fresnel / cylindrical center density so edges dissolve softly
+          float ndv = abs(dot(normalize(vNormalView), normalize(vViewDir)));
+          float coreMask = pow(ndv, 1.35);
+
+          // High-frequency turbulent combustion flutter along plume
+          float turb = 0.88 + 0.12 * sin(axial * 28.0 - uTime * 54.0 + vUv.x * 12.56);
+
+          // Standing supersonic Mach shock-diamond wavelets concentrated along core
+          float shockFreq = mix(18.0, 30.0, clamp(uMach * 0.6, 0.0, 1.0));
+          float shockWave = pow(max(0.0, sin(axial * shockFreq - uTime * 6.0)), 4.0);
+          float shockDecay = smoothstep(0.02, 0.16, axial) * (1.0 - smoothstep(0.45, 0.96, axial));
+          float diamonds = shockWave * shockDecay * pow(ndv, 1.8) * (0.45 + 0.75 * clamp(uPower, 0.0, 1.2));
+
+          // Color gradient: hot nozzle core -> ionized shock diamonds -> amber/orange tail
+          vec3 col = mix(uCoreColor, uMidColor, smoothstep(0.05, 0.42, axial));
+          col = mix(col, uOuterColor, smoothstep(0.32, 0.88, axial));
+          col += uCoreColor * diamonds * 1.45;
+
+          float axialFade = smoothstep(0.0, 0.06, axial) * pow(1.0 - axial, 1.15);
+          float alpha = clamp((coreMask * axialFade * 0.82 + diamonds * 0.55) * turb * uPower, 0.0, 1.0);
+
+          if (alpha < 0.01) discard;
+          gl_FragColor = vec4(col * (1.1 + diamonds * 0.8), alpha);
+        }
+      `,
+    });
+    return mat;
+  };
+
   return {
     playerFuselage,
     playerRamTrim,
@@ -420,6 +500,7 @@ export function createMaterialLibrary(
     runwayAsphalt,
     concreteApron,
     oceanWater,
+    createExhaustShaderMaterial,
     dispose: () => {
       allTextures.forEach((t) => t.dispose());
       allMaterials.forEach((m) => m.dispose());

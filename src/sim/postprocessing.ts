@@ -20,8 +20,15 @@ export interface PostProcessUpdateParams {
   centerY?: number;
 }
 
+export interface PostProcessOptions {
+  bloomEnabled: boolean;
+  motionBlurEnabled: boolean;
+  aaEnabled: boolean;
+}
+
 export interface PostProcessingPipeline {
   update: (params: PostProcessUpdateParams) => void;
+  setOptions: (opts: PostProcessOptions) => void;
   render: () => void;
   resize: (width: number, height: number) => void;
   dispose: () => void;
@@ -83,7 +90,7 @@ const HighSpeedMotionBlurShader = {
       float weightSum = 0.0;
       const int TAPS = 9;
       for (int i = 0; i < TAPS; i++) {
-        float t = (float(i) / float(TAPS - 1)) - 0.5; // -0.5 .. +0.5
+        float t = (float(i) / float(TAPS - 1)) - 0.5;
         float w = 1.0 - abs(t) * 1.15;
         vec2 sampleUv = clamp(vUv - blurVec * t * 1.6, vec2(0.001), vec2(0.999));
         accum += texture2D(tDiffuse, sampleUv) * w;
@@ -112,28 +119,30 @@ export function createPostProcessingPipeline(
 ): PostProcessingPipeline {
   const size = new THREE.Vector2();
   renderer.getSize(size);
-  const w = Math.max(1, size.x);
-  const h = Math.max(1, size.y);
+  let width = Math.max(1, size.x);
+  let height = Math.max(1, size.y);
 
   const maxSamples = typeof renderer.capabilities.maxSamples === 'number' ? renderer.capabilities.maxSamples : 0;
-  const renderTarget = new THREE.WebGLRenderTarget(w, h, {
+  let currentAaSamples = Math.min(4, maxSamples);
+
+  const renderTarget = new THREE.WebGLRenderTarget(width, height, {
     type: THREE.HalfFloatType,
-    samples: Math.min(4, maxSamples),
+    samples: currentAaSamples,
   });
 
   const composer = new EffectComposer(renderer, renderTarget);
   composer.setPixelRatio(renderer.getPixelRatio());
-  composer.setSize(w, h);
+  composer.setSize(width, height);
 
   const renderPass = new RenderPass(scene, camera);
   composer.addPass(renderPass);
 
-  // High threshold preserves crisp daylight sky/clouds while glowing afterburners, explosions & flares
-  const bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.3, 0.44, 0.94);
+  // Subtle bloom tuned for engine glow, flares, and explosions without washing daylight sky
+  const bloomPass = new UnrealBloomPass(new THREE.Vector2(width, height), 0.3, 0.44, 0.94);
   composer.addPass(bloomPass);
 
   const motionBlurPass = new ShaderPass(HighSpeedMotionBlurShader);
-  motionBlurPass.uniforms.uAspect.value = w / h;
+  motionBlurPass.uniforms.uAspect.value = width / height;
   composer.addPass(motionBlurPass);
 
   // Applies ACESFilmicToneMapping + SRGBColorSpace at the end of the pipeline
@@ -148,39 +157,50 @@ export function createPostProcessingPipeline(
   let dampedCenterX = 0.5;
   let dampedCenterY = 0.5;
 
+  const setOptions = (opts: PostProcessOptions) => {
+    bloomPass.enabled = opts.bloomEnabled;
+    motionBlurPass.enabled = opts.motionBlurEnabled;
+    const nextSamples = opts.aaEnabled ? Math.min(4, maxSamples) : 0;
+    if (nextSamples !== currentAaSamples) {
+      currentAaSamples = nextSamples;
+      renderTarget.samples = nextSamples;
+      composer.reset();
+    }
+  };
+
   const update = (p: PostProcessUpdateParams) => {
     const dt = Math.max(0.001, Math.min(p.dt, 0.05));
 
-    // Mach speed factor ramps up cleanly from subsonic cruise into supersonic dash
     const speedFactor = THREE.MathUtils.clamp((p.mach - 0.58) / 1.15, 0, 1);
     const abFactor = p.afterburner ? 1 : 0;
     const shakeBoost = THREE.MathUtils.clamp(p.cameraShake * 0.45, 0, 1);
 
-    let targetRadial = (speedFactor * 0.015 + abFactor * 0.0045 + shakeBoost * 0.006);
+    let targetRadial = speedFactor * 0.014 + abFactor * 0.004 + shakeBoost * 0.0055;
     if (p.isCockpit) {
-      targetRadial *= 0.65; // keep canopy instruments & HUD comfortable
+      targetRadial *= 0.62;
     }
     if (p.isTitle) {
-      targetRadial = 0.0025; // subtle cinematic flyby polish
+      targetRadial = 0.002;
     }
     if (p.isPaused) {
       targetRadial = 0;
     }
 
-    const targetAngX = p.isPaused || p.isTitle
-      ? 0
-      : THREE.MathUtils.clamp(-p.angYawRate * 0.0048 - p.angRollRate * 0.0012, -0.012, 0.012);
-    const targetAngY = p.isPaused || p.isTitle
-      ? 0
-      : THREE.MathUtils.clamp(p.angPitchRate * 0.0048, -0.012, 0.012);
+    const targetAngX =
+      p.isPaused || p.isTitle
+        ? 0
+        : THREE.MathUtils.clamp(-p.angYawRate * 0.0045 - p.angRollRate * 0.0011, -0.011, 0.011);
+    const targetAngY =
+      p.isPaused || p.isTitle ? 0 : THREE.MathUtils.clamp(p.angPitchRate * 0.0045, -0.011, 0.011);
 
     const targetBloom = p.isPaused
       ? 0.24
       : 0.28 + abFactor * 0.14 + speedFactor * 0.08 + shakeBoost * 0.16;
 
-    const targetChroma = p.isPaused || p.isTitle
-      ? 0
-      : THREE.MathUtils.clamp((p.mach - 0.92) * 0.0024 + abFactor * 0.0008 + shakeBoost * 0.0012, 0, 0.0032);
+    const targetChroma =
+      p.isPaused || p.isTitle
+        ? 0
+        : THREE.MathUtils.clamp((p.mach - 0.92) * 0.0022 + abFactor * 0.0007 + shakeBoost * 0.0011, 0, 0.003);
 
     const targetCx = typeof p.centerX === 'number' ? THREE.MathUtils.clamp(p.centerX, 0.25, 0.75) : 0.5;
     const targetCy = typeof p.centerY === 'number' ? THREE.MathUtils.clamp(p.centerY, 0.25, 0.75) : 0.5;
@@ -207,13 +227,13 @@ export function createPostProcessingPipeline(
     composer.render();
   };
 
-  const resize = (width: number, height: number) => {
-    const rw = Math.max(1, width);
-    const rh = Math.max(1, height);
+  const resize = (w: number, h: number) => {
+    width = Math.max(1, w);
+    height = Math.max(1, h);
     composer.setPixelRatio(renderer.getPixelRatio());
-    composer.setSize(rw, rh);
-    bloomPass.resolution.set(rw, rh);
-    motionBlurPass.uniforms.uAspect.value = rw / rh;
+    composer.setSize(width, height);
+    bloomPass.resolution.set(width, height);
+    motionBlurPass.uniforms.uAspect.value = width / height;
   };
 
   const dispose = () => {
@@ -227,6 +247,7 @@ export function createPostProcessingPipeline(
 
   return {
     update,
+    setOptions,
     render,
     resize,
     dispose,
