@@ -714,6 +714,7 @@ export class JetSimulatorEngine {
     }
 
     if (this.phase === 'title' && (code === 'Enter' || code === 'Space')) {
+      if (activeTag === 'BUTTON' || activeTag === 'A' || activeTag === 'SELECT') return;
       this.startSortie();
       return;
     }

@@ -6,7 +6,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { HudOverlay } from './components/HudOverlay';
 import { SettingsModal } from './components/SettingsModal';
-import { PauseOrGameOverModal, TitleScreen } from './components/TitleAndModals';
+import { PauseOrGameOverModal, TitleScreen, type TitleViewMode } from './components/TitleAndModals';
+import {
+  CAREER_STORAGE_KEY,
+  loadCareerRecord,
+  resetCareerRecord,
+  saveCareerRecord,
+  type CareerRecord,
+  type SortieLogEntry,
+} from './sim/careerStorage';
 import {
   DEFAULT_CONTROL_BINDINGS,
   DEFAULT_DIFFICULTY_PROFILE,
@@ -138,6 +146,28 @@ const INITIAL_TELEMETRY: HudTelemetry = {
   skillTier: 'VETERAN',
 };
 
+interface SortieTracker {
+  active: boolean;
+  sortieId: string;
+  recordedFlightSec: number;
+  recordedKills: number;
+  recordedShotsFired: number;
+  recordedShotsHit: number;
+  missionOutcomeRecorded: boolean;
+}
+
+function createFreshSortieTracker(active: boolean): SortieTracker {
+  return {
+    active,
+    sortieId: `sortie_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+    recordedFlightSec: 0,
+    recordedKills: 0,
+    recordedShotsFired: 0,
+    recordedShotsHit: 0,
+    missionOutcomeRecorded: false,
+  };
+}
+
 export default function App() {
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
   const engineRef = useRef<JetSimulatorEngine | null>(null);
@@ -158,6 +188,9 @@ export default function App() {
   const [mission, setMission] = useState<MissionSpec>(() => structuredClone(PRESET_MISSIONS.destroy));
   const [timeOfDay, setTimeOfDay] = useState<TimeOfDay>('day');
 
+  const [titleView, setTitleView] = useState<TitleViewMode>('setup');
+  const [careerRecord, setCareerRecord] = useState<CareerRecord>(() => loadCareerRecord());
+
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [aiGeneratingMission, setAiGeneratingMission] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
@@ -171,6 +204,98 @@ export default function App() {
 
   const lastCommsCallRef = useRef(0);
   const prevPhaseRef = useRef<HudTelemetry['phase']>('title');
+  const sortieTrackerRef = useRef<SortieTracker>(createFreshSortieTracker(false));
+
+  const flushCareerProgress = useCallback(
+    (t: HudTelemetry, finalizeOutcome?: SortieLogEntry['outcome']) => {
+      const tr = sortieTrackerRef.current;
+      if (!tr.active) return;
+
+      const deltaTime = Math.max(0, t.flightTimeSec - tr.recordedFlightSec);
+      const deltaKills = Math.max(0, t.kills - tr.recordedKills);
+      const deltaFired = Math.max(0, t.shotsFired - tr.recordedShotsFired);
+      const deltaHit = Math.max(0, t.shotsHit - tr.recordedShotsHit);
+
+      if (!finalizeOutcome && deltaTime < 0.1 && deltaKills === 0 && deltaFired === 0 && deltaHit === 0) {
+        return;
+      }
+
+      tr.recordedFlightSec = Math.max(tr.recordedFlightSec, t.flightTimeSec);
+      tr.recordedKills = Math.max(tr.recordedKills, t.kills);
+      tr.recordedShotsFired = Math.max(tr.recordedShotsFired, t.shotsFired);
+      tr.recordedShotsHit = Math.max(tr.recordedShotsHit, t.shotsHit);
+
+      const base = loadCareerRecord();
+      const nextKillsByAircraft = { ...base.killsByAircraft };
+      if (deltaKills > 0) {
+        nextKillsByAircraft[t.aircraftId] = (nextKillsByAircraft[t.aircraftId] ?? 0) + deltaKills;
+      }
+
+      let nextMissionsAttempted = base.missionsAttempted;
+      let nextMissionsCompleted = base.missionsCompleted;
+      let nextTotalSorties = base.totalSorties;
+      let nextTotalScore = base.totalScore;
+      let nextRecentSorties = [...base.recentSorties];
+
+      if (finalizeOutcome && !tr.missionOutcomeRecorded) {
+        tr.missionOutcomeRecorded = true;
+        nextTotalSorties += 1;
+        nextTotalScore += Math.max(0, t.score);
+        if (finalizeOutcome === 'success') {
+          nextMissionsAttempted += 1;
+          nextMissionsCompleted += 1;
+        } else if (finalizeOutcome === 'failed') {
+          nextMissionsAttempted += 1;
+        }
+        const entry: SortieLogEntry = {
+          id: tr.sortieId,
+          timestampIso: new Date().toISOString(),
+          aircraftId: t.aircraftId,
+          aircraftLabel: t.aircraftLabel,
+          missionTitle: t.missionTitle,
+          missionType: t.missionType,
+          kills: t.kills,
+          score: t.score,
+          flightTimeSec: t.flightTimeSec,
+          shotsFired: t.shotsFired,
+          shotsHit: t.shotsHit,
+          outcome: finalizeOutcome,
+        };
+        nextRecentSorties = [entry, ...nextRecentSorties].slice(0, 8);
+      } else if (tr.missionOutcomeRecorded) {
+        nextRecentSorties = nextRecentSorties.map((entry) =>
+          entry.id === tr.sortieId
+            ? {
+                ...entry,
+                kills: t.kills,
+                score: Math.max(entry.score, t.score),
+                flightTimeSec: Math.max(entry.flightTimeSec, t.flightTimeSec),
+                shotsFired: t.shotsFired,
+                shotsHit: t.shotsHit,
+              }
+            : entry
+        );
+      }
+
+      const saved = saveCareerRecord({
+        ...base,
+        totalKills: base.totalKills + deltaKills,
+        totalFlightSeconds: base.totalFlightSeconds + deltaTime,
+        missionsAttempted: nextMissionsAttempted,
+        missionsCompleted: nextMissionsCompleted,
+        totalSorties: nextTotalSorties,
+        totalScore: nextTotalScore,
+        bestScore: Math.max(base.bestScore, t.score),
+        totalShotsFired: base.totalShotsFired + deltaFired,
+        totalShotsHit: base.totalShotsHit + deltaHit,
+        killsByAircraft: nextKillsByAircraft,
+        recentSorties: nextRecentSorties,
+      });
+
+      setCareerRecord(saved);
+    },
+    []
+  );
 
   const triggerRadioComms = useCallback(async (ev: SimEventPayload) => {
     const now = Date.now();
@@ -255,12 +380,58 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Adaptive difficulty evaluation on sortie end (gameover or victory)
+  // Keep engine keyboard capture suppressed while Settings modal or Career Record view is open
+  useEffect(() => {
+    const suppress = settingsOpen || (telemetry.phase === 'title' && titleView === 'career');
+    engineRef.current?.setInputCaptureSuppressed(suppress);
+  }, [settingsOpen, telemetry.phase, titleView]);
+
+  // Sync Career Record if localStorage is updated from another tab
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === CAREER_STORAGE_KEY || e.key === null) {
+        setCareerRecord(loadCareerRecord());
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
+
+  // Periodically persist in-flight hours/kills and flush on pagehide
+  useEffect(() => {
+    const onPageHide = () => {
+      if (sortieTrackerRef.current.active) {
+        flushCareerProgress(telemetryRef.current);
+      }
+    };
+    window.addEventListener('pagehide', onPageHide);
+    const interval = window.setInterval(() => {
+      if (telemetryRef.current.phase === 'playing' && sortieTrackerRef.current.active) {
+        flushCareerProgress(telemetryRef.current);
+      }
+    }, 10000);
+    return () => {
+      window.removeEventListener('pagehide', onPageHide);
+      window.clearInterval(interval);
+    };
+  }, [flushCareerProgress]);
+
+  // Sortie lifecycle tracking: Career Record persistence + Adaptive difficulty evaluation
   useEffect(() => {
     const prev = prevPhaseRef.current;
     prevPhaseRef.current = telemetry.phase;
 
+    if (prev === 'title' && telemetry.phase === 'playing') {
+      // Covers keyboard Enter/Space launch directly from Title Screen
+      if (!sortieTrackerRef.current.active) {
+        sortieTrackerRef.current = createFreshSortieTracker(true);
+      }
+      setTitleView('setup');
+    }
+
     if (prev === 'playing' && (telemetry.phase === 'gameover' || telemetry.phase === 'victory')) {
+      flushCareerProgress(telemetry, telemetry.phase === 'victory' ? 'success' : 'failed');
+
       const acc = telemetry.shotsFired > 0 ? Math.round((telemetry.shotsHit / telemetry.shotsFired) * 100) : 0;
       void (async () => {
         try {
@@ -285,7 +456,17 @@ export default function App() {
         }
       })();
     }
-  }, [telemetry.phase, telemetry.shotsFired, telemetry.shotsHit, telemetry.kills, telemetry.hullPct, telemetry.flightTimeSec, telemetry.wave]);
+  }, [
+    telemetry,
+    telemetry.phase,
+    telemetry.shotsFired,
+    telemetry.shotsHit,
+    telemetry.kills,
+    telemetry.hullPct,
+    telemetry.flightTimeSec,
+    telemetry.wave,
+    flushCareerProgress,
+  ]);
 
   const handleChangeGraphics = (next: GraphicsSettings) => {
     setGraphics(next);
@@ -391,14 +572,49 @@ export default function App() {
   };
 
   const handleSelectAircraft = (id: AircraftId) => engineRef.current?.setAircraft(id);
+
   const handleStart = () => {
+    if (sortieTrackerRef.current.active) {
+      if (!sortieTrackerRef.current.missionOutcomeRecorded && telemetryRef.current.flightTimeSec >= 3) {
+        flushCareerProgress(telemetryRef.current, 'aborted');
+      } else {
+        flushCareerProgress(telemetryRef.current);
+      }
+    }
+    sortieTrackerRef.current = createFreshSortieTracker(true);
+    setTitleView('setup');
     setRadioFeed([]);
     setCopilotOpen(false);
     engineRef.current?.startSortie(false);
   };
+
   const handleContinueEndless = () => engineRef.current?.startSortie(true);
   const handleTogglePause = () => engineRef.current?.togglePause();
-  const handleReturnToTitle = () => engineRef.current?.setPhase('title');
+
+  const handleReturnToTitle = () => {
+    if (sortieTrackerRef.current.active) {
+      if (!sortieTrackerRef.current.missionOutcomeRecorded && telemetryRef.current.flightTimeSec >= 3) {
+        flushCareerProgress(telemetryRef.current, 'aborted');
+      } else {
+        flushCareerProgress(telemetryRef.current);
+      }
+      sortieTrackerRef.current.active = false;
+    }
+    setCareerRecord(loadCareerRecord());
+    engineRef.current?.setPhase('title');
+  };
+
+  const handleChangeTitleView = (view: TitleViewMode) => {
+    if (view === 'career') {
+      setCareerRecord(loadCareerRecord());
+    }
+    setTitleView(view);
+  };
+
+  const handleResetCareerRecord = () => {
+    setCareerRecord(resetCareerRecord());
+  };
+
   const handleSetCamera = (mode: CameraMode) => engineRef.current?.setCameraMode(mode);
   const handleSetControlMode = (mode: ControlMode) => engineRef.current?.setControlMode(mode);
   const handleSetWeapon = (w: WeaponType) => engineRef.current?.setWeapon(w);
@@ -431,11 +647,15 @@ export default function App() {
           timeOfDay={timeOfDay}
           aiGeneratingMission={aiGeneratingMission}
           aiError={aiError}
+          titleView={titleView}
+          careerRecord={careerRecord}
           onSelectAircraft={handleSelectAircraft}
           onSelectControlMode={handleSetControlMode}
           onSelectMissionType={handleSelectMissionType}
           onSelectTimeOfDay={handleSelectTimeOfDay}
           onGenerateAiMission={handleGenerateAiMission}
+          onChangeTitleView={handleChangeTitleView}
+          onResetCareerRecord={handleResetCareerRecord}
           onOpenSettings={() => setSettingsOpen(true)}
           onToggleMute={handleToggleMute}
           onStart={handleStart}
